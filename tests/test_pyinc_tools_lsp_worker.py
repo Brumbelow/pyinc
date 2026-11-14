@@ -4,17 +4,24 @@ The server publishes diagnostics on its own after every edit and refresh. A
 client that also pulled them would show each one twice, so the server does
 not advertise pull diagnostics. It still answers a pull request from a client
 that sends one anyway.
+
+One worker thread runs the analyses and sends the publishes. The tests below
+hold an analysis on events and wait for the worker to go idle. None of them
+sleeps.
 """
 
 from __future__ import annotations
 
 import io
+import os
+import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from pyinc_tools._jsonrpc import read_message
 from pyinc_tools.lsp import LanguageServer
 from pyinc_tools.session import PollingWorkspaceWatcher, WorkspaceSession
 
@@ -95,22 +102,78 @@ def test_workspace_pull_still_gets_a_report_per_file(
     assert [item["code"] for item in reports[0]["items"]] == ["missing-import"]
 
 
+#: Only a thread that never arrives reaches it. A cold analysis on a loaded
+#: machine takes seconds, and every wait below may span one.
+_TIMEOUT = 120.0
+
+
+class _HeldAnalysis:
+    """One workspace analysis that stops until the test releases it.
+
+    With ``holding_session_lock`` it stops before analyzing, inside the
+    session lock, as a real analysis holds it. Without it, it stops after
+    analyzing, with the session lock free and its result not yet published.
+    It never stops on the thread that sends the test's notifications, because
+    only that thread can release it.
+    """
+
+    def __init__(self, *, holding_session_lock: bool) -> None:
+        self.holding_session_lock = holding_session_lock
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def run(
+        self,
+        session: WorkspaceSession,
+        analyze: Callable[[WorkspaceSession], Any],
+        *,
+        stop: bool,
+    ) -> Any:
+        try:
+            if self.holding_session_lock:
+                with session._state_lock:
+                    self._stop_here(stop)
+                    return analyze(session)
+            result = analyze(session)
+            self._stop_here(stop)
+            return result
+        finally:
+            self.finished.set()
+
+    def _stop_here(self, stop: bool) -> None:
+        self.entered.set()
+        if stop and not self.release.wait(_TIMEOUT):
+            raise AssertionError("the test never released the held analysis")
+
+
 class _WatchedServer:
     """A server whose watcher polls only when the test calls `poll`.
 
     The watcher is the one `initialize` builds, with its debounce at zero. Its
     thread is never started. `poll` runs one poll and hands what it found to
-    the server's callback, as the watcher thread does.
+    the server's callback, as the watcher thread does. Every workspace
+    analysis is counted, with the name of the thread it ran on, and `hold`
+    stops the next one.
     """
 
     def __init__(self, root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self.analyses = 0
+        self.analysis_threads: list[str] = []
+        self.out = io.BytesIO()
+        self._held: _HeldAnalysis | None = None
+        self._test_thread = threading.current_thread()
         self._on_change: Callable[[tuple[str, ...]], None] | None = None
         original = WorkspaceSession.analyze_workspace
 
         def counting_analyze_workspace(session: WorkspaceSession) -> Any:
             self.analyses += 1
-            return original(session)
+            self.analysis_threads.append(threading.current_thread().name)
+            held, self._held = self._held, None
+            if held is None:
+                return original(session)
+            stop = threading.current_thread() is not self._test_thread
+            return held.run(session, original, stop=stop)
 
         def start_without_thread(
             watcher: PollingWorkspaceWatcher,
@@ -122,7 +185,7 @@ class _WatchedServer:
         monkeypatch.setattr(WorkspaceSession, "analyze_workspace", counting_analyze_workspace)
         monkeypatch.setattr(PollingWorkspaceWatcher, "start", start_without_thread)
         self.server = LanguageServer(
-            in_stream=io.BytesIO(), out_stream=io.BytesIO(), default_root=str(root)
+            in_stream=io.BytesIO(), out_stream=self.out, default_root=str(root)
         )
         self.server._handle_request(
             "initialize",
@@ -136,6 +199,28 @@ class _WatchedServer:
     def notify(self, method: str, params: dict[str, Any]) -> None:
         self.server._handle_message({"jsonrpc": "2.0", "method": method, "params": params})
 
+    def open(self, path: Path, text: str) -> None:
+        self.notify(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": path.as_uri(),
+                    "languageId": "python",
+                    "version": 1,
+                    "text": text,
+                }
+            },
+        )
+
+    def change(self, path: Path, text: str) -> None:
+        self.notify(
+            "textDocument/didChange",
+            {
+                "textDocument": {"uri": path.as_uri(), "version": 2},
+                "contentChanges": [{"text": text}],
+            },
+        )
+
     def poll(self) -> tuple[str, ...]:
         watcher = self.server._watcher
         assert watcher is not None and self._on_change is not None
@@ -143,6 +228,34 @@ class _WatchedServer:
         if ready:
             self._on_change(ready)
         return ready
+
+    def hold(self, *, holding_session_lock: bool) -> _HeldAnalysis:
+        """Stop the next workspace analysis until the test releases it."""
+        held = _HeldAnalysis(holding_session_lock=holding_session_lock)
+        self._held = held
+        return held
+
+    def drain(self) -> None:
+        """Wait until every publish the notifications so far scheduled is sent."""
+        assert self.server.wait_idle(_TIMEOUT), "the diagnostics worker did not go idle"
+
+    def messages(self) -> list[dict[str, Any]]:
+        replay = io.BytesIO(self.out.getvalue())
+        messages: list[dict[str, Any]] = []
+        while (message := read_message(replay)) is not None:
+            messages.append(message)
+        return messages
+
+    def published(self) -> list[tuple[str, list[str]]]:
+        """Each publishDiagnostics sent so far, as its URI and its messages."""
+        return [
+            (
+                message["params"]["uri"],
+                [item["message"] for item in message["params"]["diagnostics"]],
+            )
+            for message in self.messages()
+            if message.get("method") == "textDocument/publishDiagnostics"
+        ]
 
     def close(self) -> None:
         self.server._teardown_session()
@@ -179,12 +292,14 @@ def test_save_runs_one_workspace_analysis(watched: tuple[_WatchedServer, Path]) 
         "textDocument/didChange",
         {"textDocument": {"uri": uri, "version": 2}, "contentChanges": [{"text": "value = 2\n"}]},
     )
+    harness.drain()
     before_save = harness.analyses
 
     path.write_text("value = 2\n", encoding="utf-8")
     harness.notify("textDocument/didSave", {"textDocument": {"uri": uri}})
 
     assert harness.poll() == ()
+    harness.drain()
     assert harness.analyses == before_save + 1
 
 
@@ -198,6 +313,188 @@ def test_disk_edit_of_a_closed_file_is_still_refreshed(
     path.write_text("other = 2\n", encoding="utf-8")
 
     assert harness.poll() == (str(path),)
+    harness.drain()
     assert harness.analyses == 1
     mirrored = Path(session.mirror_root, "other.py")
     assert mirrored.read_text(encoding="utf-8") == "other = 2\n"
+
+
+def test_unchanged_did_change_runs_no_analysis(
+    watched: tuple[_WatchedServer, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A didChange that repeats the client's last text writes and analyzes nothing."""
+
+    harness, root = watched
+    path = root / "app.py"
+    writes: list[str] = []
+    original_set_overlay = WorkspaceSession.set_overlay
+
+    def counting_set_overlay(
+        session: WorkspaceSession, file_path: str | os.PathLike[str], text: str
+    ) -> str:
+        writes.append(text)
+        return original_set_overlay(session, file_path, text)
+
+    monkeypatch.setattr(WorkspaceSession, "set_overlay", counting_set_overlay)
+    harness.open(path, "value = 2\n")
+    harness.drain()
+    after_open = harness.analyses
+    assert writes == ["value = 2\n"]
+
+    harness.change(path, "value = 2\n")
+    harness.drain()
+
+    assert harness.analyses == after_open
+    assert writes == ["value = 2\n"]
+
+
+def test_rapid_changes_during_an_analysis_run_one_more(
+    watched: tuple[_WatchedServer, Path],
+) -> None:
+    """Ten edits made while an analysis is held leave one more analysis due.
+
+    Each didChange used to run its own workspace analysis before the server
+    read the next message. Now each one writes the overlay and returns. The
+    held analysis then publishes what it found, and the one more analysis
+    publishes the last text.
+    """
+
+    harness, root = watched
+    path = root / "app.py"
+    held = harness.hold(holding_session_lock=False)
+    harness.open(path, "import missing_0\n")
+    assert held.entered.wait(_TIMEOUT)
+    try:
+        for index in range(1, 11):
+            harness.change(path, f"import missing_{index}\n")
+    finally:
+        held.release.set()
+    harness.drain()
+
+    assert harness.analyses <= 2
+    uri = path.as_uri()
+    last = [messages for published_uri, messages in harness.published() if published_uri == uri][-1]
+    assert len(last) == 1 and "'missing_10'" in last[0]
+
+
+def test_shutdown_during_an_analysis_is_answered_and_nothing_is_published_after(
+    watched: tuple[_WatchedServer, Path],
+) -> None:
+    """shutdown is answered while an analysis holds the session lock.
+
+    That analysis finds a diagnostic. Its publish comes after the answer, so
+    it is dropped. exit then waits for the worker.
+    """
+
+    harness, root = watched
+    path = root / "app.py"
+    held = harness.hold(holding_session_lock=True)
+    harness.open(path, "import missing_0\n")
+    assert held.entered.wait(_TIMEOUT)
+    answered = threading.Event()
+
+    def shut_down() -> None:
+        harness.server._handle_message(
+            {"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": {}}
+        )
+        answered.set()
+
+    requester = threading.Thread(target=shut_down)
+    requester.start()
+    try:
+        assert answered.wait(_TIMEOUT)
+        assert not held.finished.is_set()
+    finally:
+        held.release.set()
+        requester.join(_TIMEOUT)
+    assert held.finished.wait(_TIMEOUT)
+
+    assert (
+        harness.server._handle_message({"jsonrpc": "2.0", "method": "exit", "params": {}}) is False
+    )
+    assert harness.server.wait_idle(0)
+    messages = harness.messages()
+    answer = messages.index({"jsonrpc": "2.0", "id": 2, "result": None})
+    assert [
+        message
+        for message in messages[answer:]
+        if message.get("method") == "textDocument/publishDiagnostics"
+    ] == []
+
+
+def test_exit_and_teardown_wait_for_a_busy_worker_once(
+    watched: tuple[_WatchedServer, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """exit joins a busy worker, and the teardown after it does not join it again.
+
+    The worker's join is replaced by one that returns at once, as a join that
+    times out does, so the worker is still running when each caller looks.
+    """
+
+    harness, root = watched
+    held = harness.hold(holding_session_lock=False)
+    harness.open(root / "app.py", "import missing_0\n")
+    assert held.entered.wait(_TIMEOUT)
+    worker = harness.server._worker_thread
+    assert worker is not None
+    joins: list[float | None] = []
+
+    def timed_out_join(timeout: float | None = None) -> None:
+        joins.append(timeout)
+
+    monkeypatch.setattr(worker, "join", timed_out_join)
+    try:
+        assert (
+            harness.server._handle_message({"jsonrpc": "2.0", "method": "exit", "params": {}})
+            is False
+        )
+        assert joins == [5.0]
+        harness.server._teardown_session()
+    finally:
+        held.release.set()
+    harness.drain()
+
+    assert joins == [5.0]
+    timeouts = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if "diagnostics worker did not stop within timeout" in line
+    ]
+    assert len(timeouts) == 1
+
+
+def test_watcher_and_did_change_publish_in_the_order_their_analyses_ran(
+    watched: tuple[_WatchedServer, Path],
+) -> None:
+    """A watcher refresh and an edit both reach the client, oldest first.
+
+    The watcher callback schedules a publish and returns, so its analysis runs
+    on the diagnostics worker. An edit made while that analysis is held is
+    analyzed by the next run, and its publish follows.
+    """
+
+    harness, root = watched
+    app = root / "app.py"
+    other = root / "other.py"
+    harness.open(app, "value = 1\n")
+    harness.drain()
+    before = harness.analyses
+
+    held = harness.hold(holding_session_lock=False)
+    other.write_text("import missing_b\n", encoding="utf-8")
+    assert harness.poll() == (str(other),)
+    assert held.entered.wait(_TIMEOUT)
+    try:
+        harness.change(app, "import missing_c\n")
+    finally:
+        held.release.set()
+    harness.drain()
+
+    assert harness.analyses - before <= 2
+    assert set(harness.analysis_threads) == {"pyinc-tools-diagnostics"}
+    published = harness.published()
+    assert [uri for uri, _messages in published] == [other.as_uri(), app.as_uri()]
+    assert "'missing_b'" in published[0][1][0]
+    assert "'missing_c'" in published[1][1][0]

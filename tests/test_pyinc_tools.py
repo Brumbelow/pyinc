@@ -1173,10 +1173,12 @@ def test_lsp_close_and_watched_file_notifications_refresh_diagnostics(tmp_path: 
                 }
             },
         )
+        assert server.wait_idle(120)
         assert _workspace_symbol_names(server, "extra") == {"extra"}
         assert _published_diagnostics(out) == [(uri, ("missing-import",))]
 
         assert server._handle_notification("textDocument/didClose", {"textDocument": {"uri": uri}})
+        assert server.wait_idle(120)
         assert _workspace_symbol_names(server, "extra") == set()
         assert _workspace_symbol_names(server, "helper") == {"helper"}
         assert target.read_text(encoding="utf-8") == on_disk
@@ -2544,7 +2546,7 @@ def test_publish_torn_down_right_after_reading_the_session_sends_nothing(
 ) -> None:
     """A teardown between the session check and its use leaves nothing to fail.
 
-    `publish_workspace_diagnostics` runs on the watcher thread and is public,
+    `publish_workspace_diagnostics` runs on the diagnostics worker and is public,
     while teardown runs on the request loop. It checked `_session` and read it
     again to analyze, so a teardown in between left it calling
     `analyze_workspace` on None.
@@ -2648,12 +2650,12 @@ def _race_watcher_publish_with_edit(server: LanguageServer, path: Path, text: st
     """Hold a watcher publish after its analysis while the request loop edits.
 
     A watcher-like thread publishes and stops right after its analysis. The
-    request loop then handles a didChange of ``path`` to ``text``. Before the
-    fix, the edit's publish ran beside the held one and finished first. The
-    request loop then reached the rendezvous, which let the held publish go on
-    to send. After the fix, the edit's publish queues on the publish lock, and
-    queueing there lets the held publish finish first. Returns what the watcher
-    publish raised.
+    request loop then handles a didChange of ``path`` to ``text`` and waits for
+    the diagnostics worker to publish the edit. Before the fix, that publish
+    ran beside the held one and finished first. The request loop then reached
+    the rendezvous, which let the held publish go on to send. After the fix,
+    the edit's publish queues on the publish lock, and queueing there lets the
+    held publish finish first. Returns what the watcher publish raised.
     """
 
     session = server._session
@@ -2682,6 +2684,7 @@ def _race_watcher_publish_with_edit(server: LanguageServer, path: Path, text: st
     def request_loop_edit() -> None:
         assert watcher_analyzed.wait(10)
         _did_change(server, path, text)
+        assert server.wait_idle(120)
         rendezvous.point()
 
     session.analyze_workspace = analyze_then_hold_the_watcher  # type: ignore[method-assign]
@@ -2724,6 +2727,7 @@ def test_publishes_reach_the_client_in_the_order_their_analyses_ran(
 
         assert _diagnostic_publications(out) == [(uri, ["missing-import"]), (uri, [])]
         _did_change(server, path, "from . import missing\n")
+        assert server.wait_idle(120)
         assert _diagnostic_publications(out)[2:] == [(uri, ["missing-import"])]
         assert errors == []
     finally:
@@ -2766,6 +2770,7 @@ def test_diagnostic_skipped_for_a_stale_range_is_sent_when_it_comes_back(
 
         assert _diagnostic_publications(out) == []
         _did_change(server, path, broken)
+        assert server.wait_idle(120)
         uri = path.resolve().as_uri()
         assert _diagnostic_publications(out) == [(uri, ["unresolved-symbol"])]
         assert errors == []
@@ -7848,6 +7853,7 @@ def test_language_server_delivers_a_file_level_diagnostic_when_the_first_line_is
             {"rootUri": root.as_uri(), "initializationOptions": {"pyinc.watcher.enabled": False}},
         )
         server._handle_message({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        assert server.wait_idle(120)
         server._handle_message(
             {
                 "jsonrpc": "2.0",

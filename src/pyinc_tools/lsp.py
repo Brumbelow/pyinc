@@ -539,25 +539,49 @@ class LanguageServer:
         self._position_encoding: PositionEncoding = "utf-16"
         self._published_paths: set[str] = set()
         self._published_signatures: dict[str, tuple[tuple[Any, ...], ...]] = {}
-        # The watcher callback publishes diagnostics from its polling thread
-        # while the request loop writes responses and publishes too. These
-        # locks keep them apart. A thread that holds more than one takes them
-        # in this order: the publish lock, then the session's lock (taken by an
-        # analysis and by reading document text), then the write lock.
+        # The last full text the client sent for each open file, by real path.
+        # Only the request loop reads or writes it.
+        self._client_texts: dict[str, str] = {}
+        # Diagnostics are published by one worker thread, while the request
+        # loop writes responses. These locks keep them apart. A thread that
+        # holds more than one takes them in this order: the publish lock, then
+        # the session's lock (taken by an analysis and by reading document
+        # text), then the write lock.
         #
         # The publish lock is held for a whole publish, from before the
         # analysis until the last notification is sent. Publishes therefore
         # reach the client in the order their analyses ran. It also guards the
         # published-diagnostics bookkeeping. Teardown never takes it, because
-        # the watcher thread may hold it while teardown joins that thread.
+        # the diagnostics worker may hold it while teardown joins the worker.
         #
         # The write lock keeps each frame on the output stream whole (a frame
         # is two writes plus a flush). `_session` is set and cleared under it
         # too, so a send that holds it knows whether the session it analyzed
-        # is still the server's. It is never held while a session is closed or
-        # a watcher joined, because the watcher thread may be waiting for it.
+        # is still the server's. It is never held while a session is closed
+        # or the diagnostics worker joined, because the worker may wait for it.
+        # Shutdown sets `_shutdown_requested` under it, so a publish is sent
+        # before the shutdown answer or not at all.
+        #
+        # The worker lock guards the worker's thread, its two flags and the
+        # thread last waited for. It is never held together with another lock,
+        # so it has no place in the order above. Holding it, a thread only
+        # reads or sets those fields and starts the thread.
         self._publish_lock = threading.RLock()
         self._write_lock = threading.RLock()
+        self._worker_lock = threading.Condition(threading.Lock())
+        # The thread running publishes, or None while no run is due. It exits
+        # when no run is due, and the next change starts a new one.
+        self._worker_thread: threading.Thread | None = None
+        # A change has landed since the worker began its current run, so one
+        # more run is due.
+        self._workspace_dirty = False
+        # Set by shutdown and teardown. No run starts while it is set.
+        self._worker_stopped = False
+        # The worker thread a stop already joined. exit joins it for up to 5 s,
+        # and the teardown that follows does not join it again. Closing the
+        # session still waits for a running analysis to release the session
+        # lock.
+        self._joined_worker: threading.Thread | None = None
 
     def serve(self) -> int:
         try:
@@ -698,8 +722,14 @@ class LanguageServer:
         if method == "initialize":
             return self._initialize(params)
         if method == "shutdown":
-            self._shutdown_requested = True
-            self._teardown_session()
+            # Answered without waiting for a running analysis, which holds the
+            # session lock. The worker and the watcher are told to stop, and
+            # exit or the end of input closes the session. The flag is set
+            # under the write lock, so no diagnostics follow this answer.
+            with self._write_lock:
+                self._shutdown_requested = True
+            self._stop_diagnostics_worker(wait=False)
+            self._stop_watcher(wait=False)
             return None
         if method == "textDocument/documentSymbol":
             return self._document_symbols(params)
@@ -771,11 +801,12 @@ class LanguageServer:
         if method == "exit":
             self._exit_status = 0 if self._shutdown_requested else 1
             self._stop_watcher()
+            self._stop_diagnostics_worker()
             return False
         if not self._initialized or self._shutdown_requested:
             return True
         if method == "initialized":
-            self.publish_workspace_diagnostics()
+            self._schedule_diagnostics()
             return True
         params = convert_payload_positions(
             params,
@@ -784,12 +815,14 @@ class LanguageServer:
             source_for_uri=self._source_for_uri,
             uri=self._default_uri(params),
         )
+        # The document handlers change the overlay at once, so a request that
+        # follows sees the edit. The analysis runs later on the worker.
         if method == "textDocument/didOpen":
             document = params["textDocument"]
-            self._require_session().set_overlay(
-                self._require_safe_path(document["uri"]), document["text"]
-            )
-            self.publish_workspace_diagnostics()
+            path = self._require_safe_path(document["uri"])
+            self._require_session().set_overlay(path, document["text"])
+            self._client_texts[path] = document["text"]
+            self._schedule_diagnostics()
             return True
         if method == "textDocument/didChange":
             document = params["textDocument"]
@@ -797,20 +830,30 @@ class LanguageServer:
             if changes:
                 latest = changes[-1]
                 if "text" in latest:
-                    self._require_session().set_overlay(
-                        self._require_safe_path(document["uri"]), latest["text"]
-                    )
-                    self.publish_workspace_diagnostics()
+                    path = self._require_safe_path(document["uri"])
+                    # The overlay already holds this text, so there is nothing
+                    # to write or analyze.
+                    if self._client_texts.get(path) == latest["text"]:
+                        return True
+                    self._require_session().set_overlay(path, latest["text"])
+                    self._client_texts[path] = latest["text"]
+                    self._schedule_diagnostics()
             return True
         if method == "textDocument/didSave":
             document = params["textDocument"]
-            self._require_session().clear_overlay(self._require_safe_path(document["uri"]))
-            self.publish_workspace_diagnostics()
+            path = self._require_safe_path(document["uri"])
+            self._require_session().clear_overlay(path)
+            # The mirror now holds the disk text, which can differ from the
+            # buffer. The next didChange is written whatever it holds.
+            self._client_texts.pop(path, None)
+            self._schedule_diagnostics()
             return True
         if method == "textDocument/didClose":
             document = params["textDocument"]
-            self._require_session().clear_overlay(self._require_safe_path(document["uri"]))
-            self.publish_workspace_diagnostics()
+            path = self._require_safe_path(document["uri"])
+            self._require_session().clear_overlay(path)
+            self._client_texts.pop(path, None)
+            self._schedule_diagnostics()
             return True
         if method == "workspace/didChangeWatchedFiles":
             changes = params.get("changes", [])
@@ -832,14 +875,14 @@ class LanguageServer:
 
     def publish_workspace_diagnostics(self) -> None:
         # The publish lock is held from before the analysis until the last
-        # send. A watcher publish whose analysis ran before an edit therefore
-        # sends before the request loop publishes that edit, and the client
-        # ends with the diagnostics of the latest analysis.
+        # send. A publish whose analysis ran before an edit therefore sends
+        # before the edit's publish, and the client ends with the diagnostics
+        # of the latest analysis.
         with self._publish_lock:
-            # The watcher thread calls this while the request loop may be
-            # tearing the session down. So the session is read once, because a
-            # second read could find None. A session torn down meanwhile is
-            # closed, and the server leaves its analysis unpublished.
+            # The worker calls this while the request loop may be tearing the
+            # session down. So the session is read once, because a second read
+            # could find None. A session torn down meanwhile is closed, and the
+            # server leaves its analysis unpublished.
             session = self._session
             if session is None:
                 return
@@ -990,6 +1033,10 @@ class LanguageServer:
                 self._session = session
                 self._published_paths.clear()
                 self._published_signatures.clear()
+            # A failed initialize tore down and stopped the worker. A later
+            # one that succeeds publishes again.
+            with self._worker_lock:
+                self._worker_stopped = False
 
             watcher_enabled = bool(options.get("pyinc.watcher.enabled", True))
             if watcher_enabled:
@@ -1088,29 +1135,131 @@ class LanguageServer:
         }
 
     def _on_watcher_change(self, _changed: tuple[str, ...]) -> None:
+        # The watcher has already refreshed the paths. The analysis runs on the
+        # worker, so the watcher thread goes back to polling.
+        self._schedule_diagnostics()
+
+    def _schedule_diagnostics(self) -> None:
+        """Have the worker publish diagnostics for the current workspace state.
+
+        A change that lands while a run is going leaves one more run due, and
+        any number of such changes leave one. That run analyzes the state as it
+        is when it starts, so the last publish describes the latest change.
+        """
+        with self._worker_lock:
+            if self._worker_stopped:
+                return
+            self._workspace_dirty = True
+            if self._worker_thread is not None:
+                return
+            thread = threading.Thread(
+                target=self._run_diagnostics_worker,
+                name="pyinc-tools-diagnostics",
+                daemon=True,
+            )
+            self._worker_thread = thread
+            try:
+                thread.start()
+            except BaseException:
+                self._worker_thread = None
+                raise
+
+    def _run_diagnostics_worker(self) -> None:
+        # One run is one publish. `publish_workspace_diagnostics` holds the
+        # publish lock for the whole run, so runs and their sends keep the
+        # order they started in.
         try:
-            self.publish_workspace_diagnostics()
-        except Exception as exc:  # pragma: no cover - defensive
+            while self._take_diagnostics_run():
+                try:
+                    self.publish_workspace_diagnostics()
+                except Exception as exc:
+                    # A session closed while it was still attached has nothing
+                    # to publish, so that error is not reported. Teardown
+                    # detaches the session first, and the publish returns
+                    # without raising then.
+                    if isinstance(exc, RuntimeError) and str(exc) == SESSION_CLOSED_MESSAGE:
+                        continue
+                    print(
+                        f"pyinc-tools lsp: publishDiagnostics raised: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+        finally:
+            # `_take_diagnostics_run` clears the thread when it ends the loop.
+            # This covers an exception that escaped the loop.
+            with self._worker_lock:
+                if self._worker_thread is threading.current_thread():
+                    self._worker_thread = None
+                    self._worker_lock.notify_all()
+
+    def _take_diagnostics_run(self) -> bool:
+        """Claim the due run, or retire this thread when none is due.
+
+        Both happen under one hold of the worker lock. A change that lands
+        after a thread retires finds no thread and starts one. A change that
+        lands before is claimed by this thread.
+        """
+        with self._worker_lock:
+            if self._workspace_dirty and not self._worker_stopped:
+                self._workspace_dirty = False
+                return True
+            self._worker_thread = None
+            self._worker_lock.notify_all()
+            return False
+
+    def _stop_diagnostics_worker(self, *, wait: bool = True) -> None:
+        """Start no further diagnostics run.
+
+        With ``wait``, wait up to 5 s for the running one to end, as the
+        watcher's teardown waits for its thread. Each thread is joined once,
+        so exit and the teardown after it join it for at most 5 s. Closing
+        the session afterwards still waits for a running analysis to release
+        the session lock, so the server ends when that analysis ends.
+        """
+        with self._worker_lock:
+            self._worker_stopped = True
+            self._workspace_dirty = False
+            thread = self._worker_thread
+            if not wait or thread is None or thread is threading.current_thread():
+                return
+            if thread is self._joined_worker:
+                return
+            self._joined_worker = thread
+        thread.join(5.0)
+        if thread.is_alive():
             print(
-                f"pyinc-tools lsp: publishDiagnostics raised: {type(exc).__name__}: {exc}",
+                "pyinc-tools lsp: diagnostics worker did not stop within timeout",
                 file=sys.stderr,
             )
 
-    def _stop_watcher(self) -> None:
+    def wait_idle(self, timeout: float | None = None) -> bool:
+        """Return True once no diagnostics run is going or due, or False on timeout.
+
+        Tests call this to see the publishes that follow a notification.
+        """
+        with self._worker_lock:
+            return self._worker_lock.wait_for(lambda: self._worker_thread is None, timeout)
+
+    def _stop_watcher(self, *, wait: bool = True) -> None:
         watcher = self._watcher
         if watcher is None:
             return
         self._watcher = None
         with contextlib.suppress(Exception):  # pragma: no cover - defensive
-            watcher.stop()
+            if wait:
+                watcher.stop()
+            else:
+                # The thread may be waiting for the session lock. Closing the
+                # session joins it, because it registered with the session.
+                watcher._request_stop()
 
     def _teardown_session(self) -> None:
         self._stop_watcher()
+        self._stop_diagnostics_worker()
         # Detached before it is closed, and under the write lock, so a publish
-        # still running on the watcher thread (its join can time out) or on a
-        # caller's thread sees that the session is gone instead of reading it
-        # closed, or reading None where a moment before it found a session. The
-        # publish lock is left alone, because that publish may still hold it.
+        # still running on the worker (its join can time out) or on a caller's
+        # thread sees that the session is gone instead of reading it closed, or
+        # reading None where a moment before it found a session. The publish
+        # lock is left alone, because that publish may still hold it.
         with self._write_lock:
             session = self._session
             self._session = None
@@ -1943,9 +2092,10 @@ class LanguageServer:
         Positions are converted before the write lock is taken. The conversion
         reads document text under the session's lock, which comes before the
         write lock in the lock order. Given a session, the notification is
-        written only while that session is still the server's. The check and
-        the write share one hold of the write lock, so teardown detaches the
-        session either before both or after both.
+        written only while that session is still the server's and shutdown has
+        not been requested. The check and the write share one hold of the
+        write lock, so teardown and shutdown land either before both or after
+        both.
         """
         converted = convert_payload_positions(
             params,
@@ -1955,7 +2105,7 @@ class LanguageServer:
             uri=params.get("uri") if isinstance(params.get("uri"), str) else None,
         )
         with self._write_lock:
-            if session is not None and self._session is not session:
+            if session is not None and (self._session is not session or self._shutdown_requested):
                 return False
             self._send({"jsonrpc": "2.0", "method": method, "params": converted})
         return True
