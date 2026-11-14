@@ -3928,13 +3928,18 @@ class WorkspaceSession:
             # The check reads a PEP 508 string, so the entry is built from the
             # parsed fields. The line as written can still hold an inline
             # comment or pip options such as `--hash`, and the check would read
-            # them as part of the version specifier.
+            # them as part of the version specifier. PEP 508 allows the
+            # specifier in parentheses, as in `foo (>=1.0)`, and the check
+            # cannot parse that form, so the parentheses are dropped.
             for requirement in requirements.requirements:
                 if requirement.is_editable or requirement.version_spec == f"@ {requirement.name}":
                     continue
                 extras = f"[{','.join(requirement.extras)}]" if requirement.extras else ""
+                spec = requirement.version_spec
+                if spec.startswith("(") and spec.endswith(")"):
+                    spec = spec[1:-1].strip()
                 markers = f" ; {requirement.markers}" if requirement.markers else ""
-                declared.append(f"{requirement.name}{extras}{requirement.version_spec}{markers}")
+                declared.append(f"{requirement.name}{extras}{spec}{markers}")
             # A record does not name the file it came from. The root file's
             # record for a name replaces an included file's, so a name the root
             # file lists keeps its range. A name only an included file lists has

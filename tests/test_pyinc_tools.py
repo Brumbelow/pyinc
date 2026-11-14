@@ -10122,13 +10122,14 @@ def _workspace_diagnostics(
 @pytest.mark.parametrize(
     ("specs", "expected"),
     [
-        (("1.0", "2.0", "1.0"), []),
+        (("1.0", "2.0", "1.0", "1.0"), []),
         (
-            ("2.0", "3.0", "2.0"),
+            ("2.0", "3.0", "2.0", "2.0"),
             [
                 ("dependency-version_mismatch", 0, "'fakepkg' with constraint '>=2.0'"),
                 ("dependency-version_mismatch", 1, "'otherpkg' with constraint '==3.0'"),
                 ("dependency-version_mismatch", 3, "'markedpkg' with constraint '>=2.0'"),
+                ("dependency-version_mismatch", 4, "'parenpkg' with constraint '>=2.0'"),
             ],
         ),
     ],
@@ -10137,15 +10138,16 @@ def _workspace_diagnostics(
 def test_requirement_comment_and_options_are_not_part_of_its_specifier(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    specs: tuple[str, str, str],
+    specs: tuple[str, str, str, str],
     expected: list[tuple[str, int, str]],
 ) -> None:
     # pip ends a requirement at an inline comment or at its first option, and
-    # pip-compile writes each hash on a continuation line. fakepkg 1.0,
-    # otherpkg 2.0 and markedpkg 1.0 are installed.
+    # pip-compile writes each hash on a continuation line. PEP 508 also allows
+    # the specifier in parentheses. fakepkg 1.0, otherpkg 2.0, markedpkg 1.0
+    # and parenpkg 1.0 are installed.
     site_dir = tmp_path / "site-packages"
     _install_fake_distribution(monkeypatch, site_dir)
-    for name, version in (("otherpkg", "2.0"), ("markedpkg", "1.0")):
+    for name, version in (("otherpkg", "2.0"), ("markedpkg", "1.0"), ("parenpkg", "1.0")):
         _write(
             site_dir / f"{name}-{version}.dist-info" / "METADATA",
             f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
@@ -10157,7 +10159,8 @@ def test_requirement_comment_and_options_are_not_part_of_its_specifier(
         f"fakepkg>={specs[0]}  # the installer\n"
         f"otherpkg=={specs[1]} \\\n"
         f"    --hash=sha256:{'a' * 64}\n"
-        f'markedpkg>={specs[2]} ; python_version >= "3"\n',
+        f'markedpkg>={specs[2]} ; python_version >= "3"\n'
+        f"parenpkg (>={specs[3]})\n",
     )
 
     with WorkspaceSession(root) as session:
