@@ -40,7 +40,7 @@ holds that lock, the child gets a new lock.
 | Entrypoints | `file_analysis`, `directory_analysis`, `module_analysis`, `workspace_analysis` |
 | Result types | `DefinitionRef`, `DependencySurface`, `Diagnostic`, `ImportRef`, `PythonFileAnalysis`, `PythonModuleAnalysis`, `PythonWorkspaceAnalysis`, `ResolvedImportRef` |
 | Supported shapes | `.py` files under a workspace; absolute and relative imports; static exports; guarded imports used for type checking or import fallbacks; workspace, stdlib, installed, missing, and ambiguous resolution. |
-| Key limits | It does not execute imports or infer dynamic exports. Conditional or dynamically constructed bindings are reported conservatively, and ambiguous module names stay ambiguous. Source can parse and still nest deeper than a recursive walk of its tree can follow. Each query whose walk runs out of stack answers as it does for source that does not parse, so a `DependencySurface` built from that walk has no exports. `file_analysis` reports no diagnostic for such a file, because its parse succeeds. How deep a walk reaches depends on the stack its caller has left, so for a file near that depth the cached answer is the one the first call computed, and another call site or a fresh database can get the other. |
+| Key limits | It does not execute imports or infer dynamic exports. Conditional or dynamically constructed bindings are reported conservatively, and ambiguous module names stay ambiguous. Source nested deeper than the parser allows gets the `syntax-error` diagnostic `source is nested too deeply to parse`. Source can parse and still nest deeper than a recursive walk of its tree can follow. Each query whose walk runs out of stack answers as it does for source that does not parse, so a `DependencySurface` built from that walk has no exports. `file_analysis` reports no diagnostic for such a file, because its parse succeeds. How deep a parse or a walk reaches depends on the stack its caller has left, so for a file near either depth the cached answer is the one the first call computed, and another call site or a fresh database can get the other. One file can parse for `file_analysis` in one database and be reported as nested too deeply by `workspace_analysis` in another. |
 
 ## Installed packages
 
@@ -50,7 +50,7 @@ holds that lock, the child gets a new lock.
 | Entrypoints | `installed_packages_analysis`, `resolve_import_name` |
 | Result types | `ImportNameResolution`, `InstalledPackageRef`, `InstalledPackagesAnalysis` |
 | Supported shapes | `.dist-info` metadata, `top_level.txt`, the top-level names in `RECORD`, distribution name fallback, `Requires-Dist`, and the running interpreter's stdlib module names. |
-| Key limits | Legacy egg formats, package installation, marker evaluation, and import-loader execution are out of scope. Deep module resolution handles namespace layout, and distribution metadata plays no part in it. Without `top_level.txt`, a distribution claims the first component of each `RECORD` path that is a package directory, a `.py` module or an extension module. A `RECORD` that names no module or lists a `.pth` file also claims the distribution name, lowercased, with each run of `-`, `_` and `.` replaced by `_`. So an editable install whose `RECORD` lists only a `.pth` keeps the name fallback, and Python source analysis reports an import of any other name from it as missing. |
+| Key limits | Legacy egg formats, package installation, marker evaluation, and import-loader execution are out of scope. Deep module resolution finds a module by namespace layout, and reads distribution metadata only to name the distribution that provides it. Without `top_level.txt`, a distribution claims the first component of each `RECORD` path that is a package directory, a `.py` module or an extension module. A `RECORD` that names no module or lists a `.pth` file also claims the distribution name, lowercased, with each run of `-`, `_` and `.` replaced by `_`. So an editable install whose `RECORD` lists only a `.pth` keeps the name fallback, and Python source analysis reports an import of any other name from it as missing. A `METADATA` or `top_level.txt` file that is not UTF-8 raises `UnicodeDecodeError` out of both entrypoints, and so does such a `RECORD` read in place of `top_level.txt`. It raises out of the entrypoints that classify imports or check installed versions too, such as `module_analysis`, `class_model`, `resolve_module_path` and `dependency_check_analysis`. |
 
 ## Deep module resolution
 
@@ -60,7 +60,7 @@ holds that lock, the child gets a new lock.
 | Entrypoints | `deep_module_resolution_analysis`, `resolve_module_path` |
 | Result types | `DeepModuleResolutionAnalysis`, `ModulePathEntry`, `NamespacePackage`, `PthDirective`, `ResolvedModuleLocation` |
 | Supported shapes | Existing directory entries from the live `sys.path`; direct `.pth` files in those entries; simple path lines; `.py` modules; packages with `__init__.py`; and PEP 420 namespace directories. |
-| Key limits | The live mutable `sys.path` is declared untracked, so it is scanned again on every request and never kept as durable state. Empty, non-string, missing, duplicate, relative, and (on Windows) rooted driveless entries are ignored. `.pth` import lines are recorded and diagnosed but never executed. Zip imports, extension modules, legacy eggs, editable-install pointer formats, path hooks, and meta-path finders stay unresolved. |
+| Key limits | The live mutable `sys.path` is declared untracked, so it is scanned again on every request and never kept as durable state. Empty, non-string, missing, duplicate, relative, and (on Windows) rooted driveless entries are ignored. `.pth` import lines are recorded and diagnosed but never executed. Zip imports, extension modules, legacy eggs, editable-install pointer formats, path hooks, and meta-path finders stay unresolved. A `.pth` file on the path that is not UTF-8 raises `UnicodeDecodeError` out of both entrypoints. It raises out of the entrypoints that locate imported modules too, such as `module_analysis`, `class_model` and `workspace_dependency_check`. |
 
 ## Dependency checking
 
@@ -209,10 +209,15 @@ compatible releases, and arbitrary equality (`===`). It evaluates PEP 508
 boolean marker expressions against the running Python environment.
 
 An installed version is checked with pre-releases allowed, matching
-dependency checking. `evaluate_version_specifier` keeps resolver-style
-pre-release exclusion unless the specifier opts in. `===` compares the version
-as written, with no normalization, padding, or case folding. So it is decided
-without parsing, and pre-release exclusion does not apply to it.
+dependency checking. `evaluate_version_specifier` rejects a pre-release or dev
+version unless a clause of the specifier names a pre-release or dev version,
+whatever its operator. So `1.5b1` satisfies `!=2.0a1` and fails `!=2.0`. A
+wildcard base cannot carry a pre-release or dev segment, so a wildcard clause
+never names one: `1.1a1` and `1.1.dev1` fail `==1.1.*`, and `3.0a1` fails
+`==3.*`. The empty specifier accepts every version that parses, pre-releases
+included. `===` compares the version as written, with no normalization,
+padding, or case folding. So it is decided without parsing, and pre-release
+exclusion does not apply to it.
 
 ### Limits
 
@@ -222,6 +227,10 @@ resolves or installs dependencies. Unsupported or unparseable constraints are
 reported as ambiguous and never guessed.
 A numeric component longer than the interpreter's integer string conversion
 limit, 4,300 digits by default, makes a version unparseable.
+`packaging` 26.0 and later differ from that pre-release rule. With its
+default arguments, `SpecifierSet.contains` returns True for each case above
+that the rule rejects, such as `1.1a1` against `==1.1.*` and `1.5b1` against
+`!=2.0`.
 
 ## Environment files
 
@@ -273,7 +282,7 @@ subclass of `ValueError`.
 | Result types | `CsvAnalysis`, `CsvColumn` |
 | Decode diagnostic | `csv-decode-error`, for a file that is not valid UTF-8. |
 | Supported shapes | CSV/TSV text handled by the stdlib CSV parser, delimiter/header sniffing, columns, row counts, and inconsistent-column diagnostics. Workspace discovery defaults to `data.csv`. |
-| Key limits | The complete file is read and parsed. Delimiter and header sniffing inspect only the first 8192 characters, so a file whose dialect or header shape shows only later may be misclassified. Line endings are translated before the dialect is sniffed. A sniffed delimiter that is a line terminator or the quote character is refused, and the text is read as comma-delimited. Text the fallback dialect also fails to read is reported as an empty table. Each step down is recorded as a `csv-dialect-error` diagnostic. Schema/type inference and a streaming result API are out of scope, and dialects the stdlib sniffer cannot identify carry no guarantee. |
+| Key limits | The complete file is read and parsed. Delimiter and header sniffing inspect only the first 8192 characters, so a file whose dialect or header shape shows only later may be misclassified. Line endings are translated before the dialect is sniffed. The delimiter is the stdlib sniffer's guess over every character, or a comma when it makes none. A wrong guess, such as `.` for a comma file with ragged rows, gets no `csv-dialect-error`: the result names that `delimiter`, splits the columns on it, and gives each row whose width differs from the first row's an `inconsistent-columns` diagnostic. A sniffed delimiter that is a line terminator or the quote character is refused, and the text is read as comma-delimited. Text the fallback dialect also fails to read is reported as an empty table. Each step down is recorded as a `csv-dialect-error` diagnostic. Schema/type inference and a streaming result API are out of scope, and dialects the stdlib sniffer cannot identify carry no guarantee. |
 
 ## Lexical scope
 
