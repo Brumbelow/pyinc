@@ -6583,7 +6583,11 @@ class Database:
                 ),
             )
         if type(value).__module__ == "typing":
-            bindings = tuple(sorted(name for name, item in vars(typing).items() if item is value))
+            # A copy: on 3.14 typing adds a lazily built name to its module
+            # dictionary on first access, from any thread.
+            bindings = tuple(
+                sorted(name for name, item in list(vars(typing).items()) if item is value)
+            )
             if bindings:
                 return ("annotation-typing-singleton", bindings)
         if type(value) is tuple:
@@ -7707,7 +7711,11 @@ class Database:
                 )
 
             functions: list[FunctionType] = []
-            for name, attribute in namespace.items():
+            # Walk a copy. Another thread can add keys to a class dictionary
+            # during the walk: on 3.14 the first read of a class's annotations
+            # caches them there. On a free-threaded build list() copies under
+            # the dictionary's lock, and tuple() does not.
+            for name, attribute in list(namespace.items()):
                 if generated_dataclass_method(name, attribute):
                     continue
                 if isinstance(attribute, FunctionType):
@@ -9813,7 +9821,11 @@ class Database:
                 bool(getattr(value, "__infer_variance__", False)),
             )
         if type(value).__module__ == "typing":
-            bindings = tuple(sorted(name for name, item in vars(typing).items() if item is value))
+            # A copy: on 3.14 typing adds a lazily built name to its module
+            # dictionary on first access, from any thread.
+            bindings = tuple(
+                sorted(name for name, item in list(vars(typing).items()) if item is value)
+            )
             if bindings:
                 return (
                     "typing-singleton",
