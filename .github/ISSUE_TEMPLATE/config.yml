@@ -3,6 +3,9 @@ contact_links:
   - name: Question or usage help
     url: https://github.com/Brumbelow/pyinc/blob/main/docs/README.md
     about: Start from the documentation index — guides, contracts, and the tooling reference.
+  - name: Feature request
+    url: https://github.com/Brumbelow/pyinc/blob/main/README.md
+    about: pyinc takes no new features. Bug and soundness fixes are welcome as pull requests.
   - name: Security or soundness disclosure
     url: https://github.com/Brumbelow/pyinc/security/advisories/new
     about: Report a vulnerability or a from-scratch consistency violation privately.

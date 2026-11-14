@@ -21,9 +21,9 @@ Please report privately through GitHub's
 [private vulnerability reporting](https://github.com/Brumbelow/pyinc/security/advisories/new).
 Keep vulnerability reports out of public issues.
 
-Expect an acknowledgement within 5 business days and an assessment within 10.
-If a fix is warranted, the release notes credit you, unless you prefer
-otherwise.
+Reports are read and answered on a best-effort basis, with no promised
+response time. If a fix is warranted, the release notes credit you, unless you
+prefer otherwise.
 
 ## Reporting a soundness violation
 
