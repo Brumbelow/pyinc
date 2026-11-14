@@ -15,8 +15,8 @@ to fix a defect.
 
 | Version | Supported |
 |---|---|
-| 5.0.x | Yes |
-| < 5.0 | No |
+| 6.0.x | Yes |
+| < 6.0 | No |
 
 ## Reporting a vulnerability
 

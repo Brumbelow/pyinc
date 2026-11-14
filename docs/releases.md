@@ -53,7 +53,7 @@ combinations.
 PyPI. Set `VERSION` to the version you are checking, without the leading `v`:
 
 ```console
-VERSION=5.0.0
+VERSION=6.0.0
 gh release download "v$VERSION" --repo Brumbelow/pyinc
 sha256sum --check SHA256SUMS
 ```

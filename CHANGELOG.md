@@ -6,6 +6,88 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [6.0.0] - 2026-11-14
+
+### Highlights
+
+- pyinc is feature-complete. Later releases carry fixes only, and
+  `pyinc_tools` and `pyinc_codegen` change only to fix a defect.
+- Python 3.11 to 3.14 and free-threaded 3.14t are the supported range. pip no
+  longer installs pyinc on 3.15, where 5.0.0 raised at the first `Database`.
+- An import statement inside a query body can no longer keep a module out of
+  query identity.
+- A tracked file read reuses the resource's identity. `python -m
+  bench.overhead` measures it 25 times faster and prints five cost ratios.
+- The language server analyzes on one worker thread. Rapid edits collapse, a
+  save runs one analysis, and hover and symbol requests run no diagnostics.
+- `pyinc-tools analyze` reports nothing on pyinc's own source, where 5.0.0
+  reported 13 false diagnostics.
+- Pull requests merge with the button. The GPG checks are removed from CI and
+  from the release workflow.
+
+### Breaking
+
+- A relative or non-standard-library `import` statement inside a query body,
+  a folded helper, a resource method, a policy or code nested in them raises
+  `UnsupportedValueError`. The module it bound was outside identity, so a warm
+  database kept the old answer. Third-party functions that import lazily, such
+  as `pygments.lex`, are refused when folded. So is a class attribute, or an
+  adapter configuration at `Database(...)`, whose fold meets such an import.
+- `inspect().is_untracked` reads False for the module export, module analysis
+  and symbol resolution records. A repeated workspace analysis with nothing
+  changed runs no query outside the `sys.path` and `.pth` families.
+- Queries that capture a pyinc object, name 128 or more attributes, or name a
+  resource class change identity, so their 5.x checkpoint records run once
+  more. The manifest stays v9.
+
+| Symbol or behaviour | Before | After | What to do |
+|---|---|---|---|
+| `import helpers` (non-standard-library or relative) in a query body, folded helper, resource method or policy | accepted, `helpers` outside identity | `UnsupportedValueError` | move the import to module scope |
+| Python 3.15 | installed, raised at the first `Database` | pip skips 6.0.0 | use 3.11 to 3.14 |
+| `diagnosticProvider` LSP capability | advertised beside pushed diagnostics | not advertised | read `textDocument/publishDiagnostics` |
+| LSP request for a document outside the root | `-32602` | `null` | none |
+| Workspace of more than 1,000 Python and manifest files; home directory or filesystem root as LSP root | analyzed | refused | `--max-files`, `pyinc.workspace.maxFiles`, or exclude directories |
+| `.json`, `.csv`, `.txt`, `.ini`, `.ipynb`, `.env` files, `node_modules`, `venv`, `site-packages` in the workspace mirror | copied | left out | none |
+| `-rother.txt`, `--index-url=URL`, a bare URL or path line in `requirements.txt` | unparseable line, or a requirement named after the URL scheme | an option or a direct reference | none |
+| `undeclared-import` in a workspace with no manifest | reported for every installed import | not reported | add `requirements.txt` or a `[project]` table |
+| Distribution installed only in the user site, with the user site off as in a virtual environment | counted as installed | not counted | install it in the environment |
+| `pyinc-tools analyze --path MISSING`; `--poll-interval-ms 0` | exit 0 with an empty result; accepted | exit 1; usage error | fix the path or the value |
+| Text integration given a file that is not UTF-8 | `UnicodeDecodeError` | `<kind>-decode-error` diagnostic | none |
+| Codegen schema with a property named like a referenced model, a definition named `annotations`, or a `$ref` into the other definitions section | generated code that fails a type check | `reserved-field-name`, `reserved-definition-name`, `unknown-ref` | rename, or fix the reference |
+
+### Fixed
+
+- A query that names 128 or more attributes (256 on 3.11) folds its
+  standard-library constants again, where a rebound one left a warm answer.
+- `db.observe` called while a span is open on another thread subscribes to
+  the query's current identity.
+- A query that names a resource class, as in
+  `db.read_resource(FileResource(), path)`, answers where it raised
+  `TypeError`.
+- Two databases folding classes on two threads no longer raise `RuntimeError`,
+  and a fork while another thread installs the guard no longer hangs the child.
+- `deserialize_snapshot` decodes in linear time.
+- Source nested too deeply to parse, a version component over 4,300 digits and
+  a distribution with no `top_level.txt` no longer raise or misreport.
+- Navigation and rename resolve through `from m import a as b`. A used alias
+  or submodule import, and a name its module binds conditionally, get no
+  diagnostic.
+- A requirement with an inline comment, a `--hash` option or a parenthesized
+  specifier is checked against the installed version.
+- The language server keeps serving after a malformed message, publishes a
+  syntax error at the end of a line, leaves out a file opened under a skipped
+  directory, skips links inside the root and removes its mirror on SIGTERM.
+
+### Changed
+
+- Every exported name and public `Database` method has a docstring. The docs
+  state the project status, each package's limits and the measured cost ratios.
+- The metadata declares `Development Status :: 5 - Production/Stable`. The
+  sdist ships `SECURITY.md`, `CONTRIBUTING.md` and the pinned
+  `constraints.txt`.
+- CI runs 21 jobs on a push or pull request and the full matrix for a release
+  tag. A weekly run replaces the nightly one.
+
 ## [5.0.0] - 2026-11-10
 
 ### Highlights
@@ -2240,3 +2322,4 @@ The first stable v1 release.
 [3.1.1]: https://github.com/Brumbelow/pyinc/releases/tag/v3.1.1
 [4.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v4.0.0
 [5.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v5.0.0
+[6.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v6.0.0
