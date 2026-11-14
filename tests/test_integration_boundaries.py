@@ -898,9 +898,9 @@ def test_no_spelling_of_an_entrypoint_runs_inside_a_query(
     # resolves to the same function and ends where the plain name ends. The
     # module plays no part in the outcome, which is why two entrypoints of the
     # same module end differently under this spelling. Importing it inside the
-    # body is the one spelling the supported interpreters disagree about, so
-    # asserting the refusal class would pin one interpreter's reading. The
-    # cell records only that the entrypoint did not run.
+    # body is refused by the kernel before the body runs, on every supported
+    # interpreter, because an import statement in a body is outside query
+    # identity. The cell records only that the entrypoint did not run.
     db = Database(mode=mode)
     outcome = _drive(
         db,
@@ -942,12 +942,12 @@ def test_no_spelling_reaches_the_index_the_interpreters_read_differently(
 def test_a_local_import_beside_a_module_level_one_never_runs(mode: str, workspace: Path) -> None:
     # The sharpest shape here, so it gets its own cell. This module imports
     # every documented entrypoint at the top, and the body below imports one of
-    # them again. The two supported interpreters disagree about that body. One
-    # reads the name the local import binds as a global of the body, and the
-    # other does not. So the entrypoint refuses this shape on one interpreter
-    # and the kernel refuses it on the other. Before the entrypoint had its
-    # refusal, this shape ran the analysis on one of them. The cell asserts
-    # only that the analysis does not happen either way.
+    # them again. The kernel refuses a body that imports an entrypoint, on
+    # every supported interpreter, before the body runs. Before the kernel
+    # refused import statements in a body, the interpreters disagreed about
+    # this shape: one read the name the local import binds as a global of the
+    # body, so the entrypoint refused there and the kernel refused on the
+    # other. The cell asserts only that the analysis does not happen.
     db = Database(mode=mode)
     module = str(workspace / "pkg" / "mod.py")
     outcome = _drive(db, _local_import_file_analysis, module)
