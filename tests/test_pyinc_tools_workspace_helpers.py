@@ -1714,3 +1714,138 @@ def test_a_new_python_file_is_analyzed_from_its_overlay(tmp_path: Path) -> None:
     real_target = str(target.resolve())
     codes = [diagnostic.code for diagnostic in result.diagnostics if diagnostic.path == real_target]
     assert codes == ["missing-import"]
+
+
+# Each case: the workspace, the tracked path a link replaces, the link target.
+_LINK_SWAPS: dict[str, tuple[dict[str, str], str, str]] = {
+    "file": (
+        {
+            "x.py": "def foo():\n    return 1\n",
+            "other.py": "def bar():\n    return 2\n",
+            "user.py": "import x\n",
+        },
+        "x.py",
+        "other.py",
+    ),
+    "loop": (
+        {
+            "x.py": "def foo():\n    return 1\n",
+            "other.py": "def bar():\n    return 2\n",
+            "user.py": "import x\n",
+        },
+        "x.py",
+        "x.py",
+    ),
+    "directory": (
+        {
+            "pkg/__init__.py": "def foo():\n    return 1\n",
+            "pkg/mod.py": "VALUE = 1\n",
+            "alt/__init__.py": "def bar():\n    return 2\n",
+            "user.py": "import pkg\n",
+        },
+        "pkg",
+        "alt",
+    ),
+}
+
+
+def _write_layout(root: Path, layout: dict[str, str], under: str | None = None) -> None:
+    for relative, text in layout.items():
+        if under is not None and relative != under and not relative.startswith(f"{under}/"):
+            continue
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize("case", sorted(_LINK_SWAPS))
+def test_a_tracked_path_replaced_by_an_in_root_link_leaves_the_mirror(
+    tmp_path: Path, case: str
+) -> None:
+    layout, name, target = _LINK_SWAPS[case]
+    root = tmp_path.resolve() / "root"
+    _write_layout(root, layout)
+    replaced = root / name
+    is_directory = replaced.is_dir()
+    module = name.removesuffix(".py")
+    swapped = tuple(
+        sorted(
+            str(root / relative)
+            for relative in layout
+            if relative == name or relative.startswith(f"{name}/")
+        )
+    )
+
+    with WorkspaceSession(root) as session:
+        watcher = workspace.PollingWorkspaceWatcher(session, debounce_ms=0)
+        if is_directory:
+            shutil.rmtree(replaced)
+        else:
+            replaced.unlink()
+        _symlink_or_skip(replaced, Path(target), target_is_directory=is_directory)
+
+        # The watcher reports the link's path, where the mirror holds the old copy.
+        assert watcher.poll() == swapped
+        linked = session.analyze_workspace()
+        linked_mirror = _mirrored_files(Path(session.mirror_root))
+        assert watcher.poll() == ()
+        with WorkspaceSession(root) as fresh:
+            assert linked == fresh.analyze_workspace()
+            assert linked_mirror == _mirrored_files(Path(fresh.mirror_root))
+
+        # The hash went with the copy, so the original put back is copied again.
+        replaced.unlink()
+        _write_layout(root, layout, under=name)
+        assert watcher.poll() == swapped
+        restored = session.analyze_workspace()
+        with WorkspaceSession(root) as fresh:
+            assert restored == fresh.analyze_workspace()
+
+    assert module not in {item.module for item in linked.python.modules}
+    diagnostics = {(Path(item.path).name, item.code) for item in linked.diagnostics}
+    assert ("user.py", "missing-import") in diagnostics
+    assert module in {item.module for item in restored.python.modules}
+
+
+def test_refreshing_a_linked_directory_drops_its_whole_mirror_copy(tmp_path: Path) -> None:
+    root = tmp_path.resolve() / "root"
+    _write_layout(root, _LINK_SWAPS["directory"][0])
+    package = root / "pkg"
+
+    with WorkspaceSession(root) as session:
+        shutil.rmtree(package)
+        _symlink_or_skip(package, Path("alt"), target_is_directory=True)
+
+        assert session.refresh_paths([package]) == (str(package), str(root / "alt"))
+        hashes = session._mirrored_content_hashes()
+        mirrored = _mirrored_files(Path(session.mirror_root))
+        with WorkspaceSession(root) as fresh:
+            assert mirrored == _mirrored_files(Path(fresh.mirror_root))
+            assert hashes == fresh._mirrored_content_hashes()
+
+
+def test_an_edit_refreshed_through_a_link_syncs_the_link_target(tmp_path: Path) -> None:
+    root = tmp_path.resolve() / "root"
+    _write_layout(
+        root,
+        {
+            "alt/__init__.py": "def bar():\n    return 2\n",
+            "user.py": "from alt import bar, baz\n",
+        },
+    )
+    target = root / "alt" / "__init__.py"
+    _symlink_or_skip(root / "pkg", Path("alt"), target_is_directory=True)
+
+    with WorkspaceSession(root) as session:
+        target.write_text(
+            "def bar():\n    return 2\n\n\ndef baz():\n    return 3\n", encoding="utf-8"
+        )
+
+        # A platform watcher can report the edit through the link.
+        through_link = root / "pkg" / "__init__.py"
+        assert session.refresh_paths([through_link]) == (str(through_link), str(target))
+        refreshed = session.analyze_workspace()
+        with WorkspaceSession(root) as fresh:
+            assert refreshed == fresh.analyze_workspace()
+
+    assert "unresolved-symbol" not in {item.code for item in refreshed.diagnostics}

@@ -630,6 +630,42 @@ class WorkspaceMirror:
             ) from exc
         return str(normalized)
 
+    def linked_path(self, path: str | os.PathLike[str]) -> str | None:
+        """`path` made absolute, when a component of it below the root is a link.
+
+        `normalize_real_path` resolves such a path to the link's target. The
+        walk skips a link and everything under a linked directory, so the
+        mirror copy to drop sits at the path as given. A link out of the root
+        raises, as it does in the walk.
+        """
+
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = self.root_path / candidate
+        try:
+            relative = candidate.relative_to(self.root_path)
+        except ValueError:
+            return None
+        if ".." in relative.parts or _first_link_component(candidate, self.root_path) is None:
+            return None
+        return str(candidate)
+
+    def link_target(self, linked: str) -> str:
+        """The real path behind `linked`, a path that `linked_path` returned.
+
+        This is the path `normalize_real_path` gives, except for a link loop.
+        `os.path.realpath` resolves a loop to a path that is still a link,
+        where `Path.resolve` raises on 3.11 and 3.12. A target outside the
+        root raises.
+        """
+
+        target = Path(os.path.realpath(linked))
+        try:
+            target.relative_to(self.root_path)
+        except ValueError as exc:
+            raise ValueError(f"{target!s} is outside the workspace root {self.root!r}.") from exc
+        return str(target)
+
     def mirror_path_for_real(self, real_path: str) -> Path:
         return self.mirror_root_path / Path(real_path).relative_to(self.root_path)
 
@@ -672,7 +708,10 @@ class WorkspaceMirror:
         relevant = allowed and (
             _is_relevant_file(source_path, self.root_path) or source_path in referenced
         )
-        self._sync_one_path(source_path, relevant=relevant)
+        if _first_link_component(source_path, self.root_path) is not None:
+            self._drop_mirror_copy(source_path)
+        else:
+            self._sync_one_path(source_path, relevant=relevant)
 
         for added in referenced - self._referenced_paths:
             self._sync_one_path(added, relevant=True)
@@ -708,6 +747,23 @@ class WorkspaceMirror:
                 return
 
         self._content_hashes.pop(key, None)
+        if mirror_path.is_dir():
+            shutil.rmtree(mirror_path)
+        elif mirror_path.exists():
+            mirror_path.unlink()
+        self._prune_empty_parents(mirror_path.parent)
+
+    def _drop_mirror_copy(self, source_path: Path) -> None:
+        """Drop what the mirror holds at and under a path a link now covers.
+
+        A fresh walk skips the link, so the mirror drops the path as it drops a
+        deleted one. Its hashes go too. Otherwise the watcher would match the
+        original content put back against a stale hash and never copy it.
+        """
+
+        for key in [key for key in self._content_hashes if Path(key).is_relative_to(source_path)]:
+            del self._content_hashes[key]
+        mirror_path = self.mirror_path_for_real(str(source_path))
         if mirror_path.is_dir():
             shutil.rmtree(mirror_path)
         elif mirror_path.exists():

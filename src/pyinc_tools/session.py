@@ -464,14 +464,22 @@ class WorkspaceSession:
             refreshed: list[str] = []
             seen: set[str] = set()
             for raw_path in paths:
-                real_path = self._normalize_real_path(raw_path)
-                if real_path in seen:
-                    continue
-                seen.add(real_path)
-                if real_path not in self._overlays:
-                    self._sync_path_from_disk(real_path)
-                self._scheduled_paths.add(real_path)
-                refreshed.append(real_path)
+                linked = self._mirror.linked_path(raw_path)
+                if linked is None:
+                    real_paths = [self._normalize_real_path(raw_path)]
+                else:
+                    # The walk skips a link, so the mirror copy at the link's
+                    # own path goes. A watcher can report an edit to the
+                    # target through the link, so the target is synced too.
+                    real_paths = [linked, self._mirror.link_target(linked)]
+                for real_path in real_paths:
+                    if real_path in seen:
+                        continue
+                    seen.add(real_path)
+                    if real_path not in self._overlays:
+                        self._sync_path_from_disk(real_path)
+                    self._scheduled_paths.add(real_path)
+                    refreshed.append(real_path)
             return tuple(refreshed)
 
     def analyze_file(self, path: str | os.PathLike[str]) -> FileAnalysisResult:
