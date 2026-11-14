@@ -752,10 +752,11 @@ class WorkspaceSession:
         for i, alias in enumerate(node.names):
             if alias.name == "*":
                 continue
-            resolved = _resolve_target(self.db, self.mirror_root, mirror_path, alias.name)
+            # Only the bound name exists in this module.
+            binding = alias.asname or alias.name
+            resolved = _resolve_target(self.db, self.mirror_root, mirror_path, binding)
             if resolved.resolution != "missing":
                 continue
-            binding = alias.asname or alias.name
             removal = self._alias_removal_edits(importer_path, source, node, i)
             if removal:
                 actions.append(
@@ -1012,37 +1013,6 @@ class WorkspaceSession:
             target=remapped_target,
             references=result.references,
         )
-
-    def _name_is_used_in_file(self, mirror_path: str, resolved: ResolvedTarget) -> bool:
-        """Is ``resolved`` referenced from inside ``mirror_path`` itself?
-
-        The unused-import check only asks about hits in the importing file. So
-        this scans that one file's occurrences and skips resolving every
-        same-named occurrence in the workspace only to discard the other files'
-        hits. It matches with `find_references`' rule minus the
-        ``include_declaration`` filter, so a declaration of the target counts as
-        a use here. That can only overreport use, so a live import always counts
-        as used.
-        """
-        target = self._symbol_id_for_resolved(resolved)
-        if target is None:
-            return False
-        for occurrence in scope_tree(self.db, mirror_path).occurrences:
-            if occurrence.name != target.name:
-                continue
-            # An import binding names the target but is not itself a
-            # declaration or usage of the target symbol.
-            if occurrence.is_declaration and occurrence.symbol_id != target:
-                continue
-            candidate = resolve_symbol_at(
-                self.db,
-                self.mirror_root,
-                mirror_path,
-                occurrence.range.start,
-            )
-            if candidate == target:
-                return True
-        return False
 
     def _symbol_id_for_resolved(self, resolved: ResolvedTarget) -> SymbolId | None:
         if (
@@ -3535,6 +3505,16 @@ class WorkspaceSession:
     ) -> tuple[AnalysisDiagnostic, ...]:
         diagnostics: list[AnalysisDiagnostic] = []
         declared_names = {status.name for status in dependency_check.statuses}
+        # `from m import a as b` binds only `b` in this module, so `b` is the
+        # name to resolve here. Both payloads place an import on its
+        # statement's first line and spell the module with its leading dots.
+        bound_names = {
+            (symbol.range.start.line, symbol.import_source_module, symbol.import_source_name): (
+                symbol.qualified_name
+            )
+            for symbol in module_symbol_table(self.db, self.mirror_root, mirror_path).symbols
+            if symbol.kind == "from_import_alias"
+        }
 
         for diagnostic in module_result.diagnostics:
             diagnostics.append(
@@ -3597,13 +3577,16 @@ class WorkspaceSession:
                 and resolved_import.imported_name is not None
                 and resolved_import.imported_name != "*"
             ):
-                symbol_result = self._remap_resolved_target(
-                    _resolve_target(
-                        self.db,
-                        self.mirror_root,
-                        mirror_path,
+                binding = bound_names.get(
+                    (
+                        resolved_import.range.start.line,
+                        resolved_import.module,
                         resolved_import.imported_name,
-                    )
+                    ),
+                    resolved_import.imported_name,
+                )
+                symbol_result = self._remap_resolved_target(
+                    _resolve_target(self.db, self.mirror_root, mirror_path, binding)
                 )
                 if symbol_result.resolution == "missing":
                     diagnostics.append(
@@ -3652,8 +3635,9 @@ class WorkspaceSession:
         Conservative by design (see the guide's ``unused-import``
         limitations). Only ``from`` imports whose target resolves to a
         workspace module are considered, so that the occurrence scan can
-        verify usage. ``import M`` is skipped because attribute usage is
-        under-reported. Stdlib and installed targets are skipped because their
+        verify usage. ``import M`` is skipped because ``import a.b`` binds
+        ``a``, and a read of ``a`` does not show that ``a.b`` is needed.
+        Stdlib and installed targets are skipped because their
         usage cannot be verified. ``__init__.py`` files, self-alias re-exports
         (``from y import z as z``), names another workspace module re-imports
         from this file, and files with syntax errors are all left alone.
@@ -3697,6 +3681,23 @@ class WorkspaceSession:
         # A name listed in this module's own static `__all__` is an intentional
         # public re-export. Removing it would break the facade's API.
         static_all = _static_module_all_names(tree)
+        # The scope tree gives one symbol per name per scope, so any read of
+        # the module variable counts: a call through an alias, an attribute
+        # read on a submodule (`sub.f()`), a string annotation, and a read
+        # after the name is rebound. That can only overreport use, so a live
+        # import always counts as used.
+        lexical = scope_tree(self.db, mirror_path)
+        read_symbols = {
+            occurrence.symbol_id
+            for occurrence in lexical.occurrences
+            if not occurrence.is_declaration
+        }
+        declared_symbols: dict[tuple[str, int], SymbolId | None] = {}
+        for occurrence in lexical.occurrences:
+            if occurrence.is_declaration:
+                declared_symbols.setdefault(
+                    (occurrence.name, occurrence.range.start.line), occurrence.symbol_id
+                )
 
         diagnostics: list[AnalysisDiagnostic] = []
         for node in ast.walk(tree):
@@ -3721,7 +3722,9 @@ class WorkspaceSession:
                 # Leave it to that diagnostic and its quick fix.
                 if resolved.resolution != "workspace":
                     continue
-                if self._name_is_used_in_file(mirror_path, resolved):
+                # A binding the scope tree does not place counts as used.
+                declared = declared_symbols.get((binding, alias.lineno - 1))
+                if declared is None or declared in read_symbols:
                     continue
                 diagnostics.append(
                     AnalysisDiagnostic(

@@ -8173,6 +8173,80 @@ def test_unused_import_diagnostic_flags_aliased_binding(tmp_path: Path) -> None:
     # The message names the local binding (`bar`) in place of the original
     # symbol (`foo`).
     assert "bar" in unused[0].message
+    # `foo` exists in `m`, so the import itself is sound.
+    assert [d for d in result.diagnostics if d.code == "unresolved-symbol"] == []
+
+
+def test_used_from_import_alias_has_no_diagnostics_or_actions(tmp_path: Path) -> None:
+    # The importer binds only `_t`. Resolving the source name `target` in the
+    # importer finds nothing, and its uses are spelled `_t`.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "m.py",
+        "def target() -> int:\n    return 1\n\n\ndef _target() -> int:\n    return 2\n",
+    )
+    _write(root / "c.py", "from m import target as _t\n\n_t()\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "c.py")
+        actions = session.code_actions_for_range(root / "c.py", 0, 0, 0, 0)
+
+    assert [d.code for d in result.diagnostics] == []
+    assert actions == ()
+
+
+def test_used_relative_from_import_alias_is_clean(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "pkg" / "__init__.py", "")
+    _write(root / "pkg" / "m.py", "def target() -> int:\n    return 1\n")
+    _write(root / "pkg" / "c.py", "from .m import target as _t\n\n_t()\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "pkg" / "c.py")
+        actions = session.code_actions_for_range(root / "pkg" / "c.py", 0, 0, 0, 0)
+
+    assert [d.code for d in result.diagnostics] == []
+    assert actions == ()
+
+
+def test_used_submodule_from_import_is_used(tmp_path: Path) -> None:
+    # A submodule binding is read as the receiver of an attribute. Its
+    # target is a module, which has no declaration range to match uses on.
+    root = tmp_path / "workspace"
+    _write(root / "pkg" / "__init__.py", "")
+    _write(root / "pkg" / "sub.py", "def f() -> int:\n    return 1\n")
+    _write(root / "pkg" / "c.py", "from . import sub\n\nsub.f()\n")
+    _write(root / "pkg" / "d.py", "from . import sub\n\nx = 1\n")
+
+    with WorkspaceSession(root) as session:
+        used = session.analyze_file(root / "pkg" / "c.py")
+        used_actions = session.code_actions_for_range(root / "pkg" / "c.py", 0, 0, 0, 0)
+        unused = session.analyze_file(root / "pkg" / "d.py")
+
+    assert [d.code for d in used.diagnostics] == []
+    assert used_actions == ()
+    assert [(d.code, d.message) for d in unused.diagnostics] == [
+        ("unused-import", "Imported name 'sub' is not used in this module.")
+    ]
+
+
+def test_unresolved_symbol_action_spares_live_alias_sibling(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def target() -> int:\n    return 1\n")
+    src = "from m import target as _t, nope\n\n_t()\n"
+    _write(root / "c.py", src)
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "c.py")
+        actions = session.code_actions_for_range(root / "c.py", 0, 0, 0, 0)
+
+    assert [(d.code, d.message) for d in result.diagnostics] == [
+        ("unresolved-symbol", "Imported name 'nope' could not be resolved from 'm'.")
+    ]
+    assert [action.title for action in actions] == ["Remove import of 'nope'"]
+    assert _apply_code_action_edits(src, actions[0].edits) == "from m import target as _t\n\n_t()\n"
 
 
 def test_unused_import_diagnostic_skips_self_alias_reexport(
