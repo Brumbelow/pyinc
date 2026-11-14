@@ -7684,21 +7684,6 @@ def test_language_server_will_delete_files_ignores_unsafe_uris(
     assert result is None
 
 
-def test_language_server_advertises_diagnostic_provider(tmp_path: Path) -> None:
-    root = tmp_path / "workspace"
-    root.mkdir()
-    server = LanguageServer(default_root=str(root))
-    try:
-        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
-    finally:
-        if server._session is not None:
-            server._session.close()
-    provider = init["capabilities"]["diagnosticProvider"]
-    assert provider["identifier"] == "pyinc-tools"
-    assert provider["interFileDependencies"] is True
-    assert provider["workspaceDiagnostics"] is True
-
-
 def test_language_server_document_diagnostic_returns_full_report(
     tmp_path: Path,
 ) -> None:

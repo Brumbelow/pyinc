@@ -1,7 +1,7 @@
 # LSP Reference
 
 `pyinc-tools lsp` is a stdio Language Server Protocol server for Python
-workspaces. This reference lists the protocol methods it advertises and the
+workspaces. This reference lists the protocol methods it handles and the
 limits visible to editors. Installation, initialization options, and editor
 configuration are in the [`pyinc-tools` guide](pyinc-tools-guide.md).
 
@@ -44,8 +44,8 @@ configuration are in the [`pyinc-tools` guide](pyinc-tools-guide.md).
 | `textDocument/prepareTypeHierarchy`, `typeHierarchy/supertypes`, `typeHierarchy/subtypes` | Direct workspace class relationships. | Omits metaclass relationships, inferred types, and navigation to installed or stdlib bases. Clients request each next level separately. |
 | `textDocument/inlayHint` | Parameter-name hints for positional arguments. | Parameter-name hints only, with no variable or return-type hints. Keyword, spread, dynamically resolved, and non-workspace calls are omitted. |
 | `textDocument/semanticTokens/full`, `textDocument/semanticTokens/range` | Namespace, class, function, method, parameter, and variable tokens. A `from ... import ...` use is classified by the workspace declaration it resolves to. | Full responses only, with no deltas. Use-site classification covers lexical names and skips general attribute chains. Imports that resolve outside the workspace, or ambiguously, are left unclassified. |
-| `textDocument/diagnostic`, `workspace/diagnostic` | Pull diagnostics with stable unchanged/full reports. | Diagnostics cover the shipped analyses only, with no general Python type checking or linting. |
-| `textDocument/publishDiagnostics` | Push diagnostics after open/change/save/close and filesystem refreshes. Pushes reach the client in the order their analyses ran. | Identical payloads are deduplicated per document. Closed clean documents may receive an empty publication to clear stale editor state. |
+| `textDocument/diagnostic`, `workspace/diagnostic` | Pull diagnostics with stable unchanged/full reports. | Not advertised, because the server already pushes the same diagnostics. Answered for a client that sends them anyway. Diagnostics cover the shipped analyses only, with no general Python type checking or linting. |
+| `textDocument/publishDiagnostics` | Push diagnostics after open/change/save/close and filesystem refreshes. Pushes reach the client in the order their analyses ran. The server pushes to every client, whatever pull support the client declares. | Identical payloads are deduplicated per document. Closed clean documents may receive an empty publication to clear stale editor state. |
 | `workspace/willRenameFiles` | Import edits for renamed Python module files. | Module files only. Package-directory renames, imports inside the renamed file, and attribute-use rewrites are out of scope. |
 | `workspace/willDeleteFiles` | Removes imports that refer to deleted Python module files. | Module files only. Package deletes and downstream attribute-use cleanup are out of scope. |
 
@@ -89,6 +89,7 @@ returned workspace edit before applying it to a structural move.
 
 The server advertises none of these capabilities: formatting, code
 formatting-on-save, range formatting, implementation navigation, document
-colors, inline values, monikers, notebook synchronization, call/type hierarchy
-beyond direct edges, semantic-token deltas, completion-item resolution,
-document-link resolution, code-lens resolution, or inlay-hint resolution.
+colors, inline values, monikers, notebook synchronization, pull diagnostics
+(`diagnosticProvider`), call/type hierarchy beyond direct edges, semantic-token
+deltas, completion-item resolution, document-link resolution, code-lens
+resolution, or inlay-hint resolution.

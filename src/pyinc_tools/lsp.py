@@ -1010,11 +1010,10 @@ class LanguageServer:
                     "full": True,
                     "range": True,
                 },
-                "diagnosticProvider": {
-                    "identifier": "pyinc-tools",
-                    "interFileDependencies": True,
-                    "workspaceDiagnostics": True,
-                },
+                # Diagnostics are pushed after every edit and refresh. A client
+                # that could also pull them would show each one twice, so pull
+                # is not advertised. The two pull methods still answer a client
+                # that calls them.
                 "workspace": {
                     "fileOperations": {
                         "willRename": {
