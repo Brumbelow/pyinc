@@ -1,4 +1,4 @@
-"""Verify the release metadata a tag names after the cryptographic trust checks.
+"""Verify the release metadata a tag names.
 
 A release tag ``vX.Y.Z`` (or a pre-release ``vX.Y.ZrcN``) must name the
 ``[project]`` version in ``pyproject.toml``, a dated ``## [X.Y.Z] - YYYY-MM-DD``

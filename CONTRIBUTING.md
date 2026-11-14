@@ -99,15 +99,8 @@ Write commit messages in the imperative mood, describing what changed and why.
 
 The maintainer cuts releases. The tag name must equal the `pyproject.toml`
 version, and a version bump lands in the same change as its `CHANGELOG.md`
-section. The release workflow verifies every commit in the released range
-against the release signing key. Those commits therefore reach `main` as a
-fast-forward push of locally signed commits, bypassing the GitHub merge button.
-
-The release workflow's structural allowlist pins one historical merge-button
-commit and verifies it by shape (all parents signed by the release key, tree
-identical to a parent). The workflow rejects any new merge-button commit, so
-follow the fast-forward rule above. Ordinary pull requests are unaffected.
-[`docs/releases.md`](docs/releases.md) describes the rest of the pipeline.
+section. [`docs/releases.md`](docs/releases.md) describes the release
+pipeline.
 
 ## Reporting a security issue
 

@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-# Tests that verify the repository as shipped: its docs, signed history,
-# release metadata and artifacts, the bench harness, and the cutoff inventory.
+# Tests that verify the repository as shipped: its docs, release metadata
+# and artifacts, the bench harness, and the cutoff inventory.
 # They give the same result on every operating system and interpreter.
 _PROCESS_FILES = frozenset(
     {
@@ -25,7 +25,6 @@ _PROCESS_FILES = frozenset(
         "test_docs.py",
         "test_release_artifacts.py",
         "test_release_metadata.py",
-        "test_signed_history.py",
     }
 )
 

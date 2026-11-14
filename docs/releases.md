@@ -1,8 +1,8 @@
 # Releases and Verification
 
 One maintainer publishes `pyinc`, so the release path is built for anyone to
-check independently. Every file on PyPI traces to a signed commit at the tip of
-`main`, and every check below runs in public CI.
+check independently. Every file on PyPI is built from the commit at the tip of
+`main` that the release tag names, and every check below runs in public CI.
 
 ## What the release workflow verifies
 
@@ -10,33 +10,9 @@ A release begins when a `v*` tag is pushed.
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) publishes
 only when all of the following hold.
 
-### The signing key
+### The tag
 
-The workflow imports
-[`.github/release-signing-key.asc`](../.github/release-signing-key.asc),
-requires it to hold a single primary key, and asserts that its fingerprint is:
-
-```
-2B6DF408BD973740052925DC894C75E1B1D05EA2
-```
-
-### The tag and the history behind it
-
-The tag must be annotated, carry a good signature from that key, and point at
-the current tip of `main`.
-[`scripts/verify_signed_history.py`](../scripts/verify_signed_history.py) then
-verifies each commit from a pinned trusted baseline up to the tag against the
-same key. An unsigned or foreign commit anywhere in the released range fails the
-release.
-
-The workflow pins one structural exception: the pull-request merge
-`3cf59c6f0a2a24ef8306a8a1ded35ac482024dbc`, created by GitHub's merge button. It
-is accepted only because all its parents verify against the release key and its
-tree is byte-identical to a parent's tree. All of its content therefore arrived
-maintainer-signed. Any other unsigned or foreign commit, merge or otherwise,
-fails the release. The same commit-range check runs in CI on every push to
-`main`, so a violation surfaces on the push that introduces it, before the next
-release.
+The tag must be annotated and point at the current tip of `main`.
 
 ### Release metadata
 
@@ -116,22 +92,3 @@ VERSION=5.0.0
 gh release download "v$VERSION" --repo Brumbelow/pyinc
 sha256sum --check SHA256SUMS
 ```
-
-To check the tag from a clone of the repository:
-
-```console
-gpg --import .github/release-signing-key.asc
-git verify-tag "v$VERSION"
-```
-
-`git verify-tag` reports a good signature from the fingerprint above, followed
-by `WARNING: This key is not certified with a trusted signature!`. That warning
-is expected after a bare `gpg --import`. It means you have not personally
-certified the key. The signature itself verified.
-
-A matching fingerprint establishes continuity with the key pinned in this
-repository: every release is signed by the same key that signed the ones before
-it. It does not establish an independently certified maintainer identity. GPG's
-warning is correct that nothing outside this repository vouches for the key.
-`git verify-commit "v$VERSION^{commit}"` checks the commit the tag names in the
-same way.
