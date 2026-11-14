@@ -266,9 +266,11 @@ def _normalize_path(path: str | os.PathLike[str]) -> str:
 
 
 def _try_parse(source: str) -> ast.Module | None:
+    # Source nested deeper than the parser's stack allows raises MemoryError or
+    # RecursionError. Such a file is unparseable, as one with a SyntaxError is.
     try:
         return ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, RecursionError, MemoryError):
         return None
 
 

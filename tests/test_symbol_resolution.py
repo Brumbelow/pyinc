@@ -238,6 +238,51 @@ def test_module_symbol_table_reports_syntax_error(tmp_path: Path) -> None:
     assert "syntax error" in table.impurity_reasons
 
 
+# The unary chain overflows the parser's own stack, and ast.parse raises
+# MemoryError. The binary chain parses, but building its tree exhausts the
+# interpreter stack, and ast.parse raises RecursionError. Both lengths are
+# several times the depth at which 3.11 and 3.14 give up.
+@pytest.mark.parametrize(
+    "expression", ["-" * 100_000 + "1", "1+" * 200_000 + "1"], ids=["unary", "binary"]
+)
+def test_module_symbol_table_reports_source_nested_too_deeply_to_parse(
+    expression: str, tmp_path: Path
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "deep.py"
+    path.write_text(f"value = {expression}\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    table = module_symbol_table(db, root, path)
+    index = workspace_symbol_index(db, root)
+
+    assert table.symbols == ()
+    assert table.impurity_reasons == ("syntax error",)
+    assert index.entries == ()
+    assert class_models_for_file(db, str(path)) == ()
+
+
+@pytest.mark.parametrize(
+    "expression", ["-" * 100_000 + "1", "1+" * 200_000 + "1"], ids=["unary", "binary"]
+)
+def test_scope_tree_skips_source_nested_too_deeply_to_parse(
+    expression: str, tmp_path: Path
+) -> None:
+    module = tmp_path / "deep.py"
+    module.write_text(f"value = {expression}\n", encoding="utf-8")
+    annotated = tmp_path / "annotated.py"
+    annotated.write_text(f'value: "{expression}" = 0\n', encoding="utf-8")
+
+    db = Database(mode="strict")
+    tree = scope_tree(db, module)
+    annotated_tree = scope_tree(db, annotated)
+
+    assert (tree.scopes, tree.bindings, tree.occurrences) == ((), (), ())
+    assert [binding.name for binding in annotated_tree.bindings] == ["value"]
+    assert [occurrence.name for occurrence in annotated_tree.occurrences] == ["value"]
+
+
 # ---------------------------------------------------------------------------
 # Annotation text extraction
 # ---------------------------------------------------------------------------

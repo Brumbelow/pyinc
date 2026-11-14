@@ -220,10 +220,16 @@ def _relative_import_module(module: str | None, level: int) -> str:
     return f"{prefix}{module or ''}"
 
 
+# Source nested deeper than the parser's stack allows makes ast.parse raise
+# MemoryError or RecursionError, depending on the interpreter version and the
+# shape of the nesting. Both are reported as a syntax error with this fixed text.
+_NESTED_TOO_DEEPLY = "source is nested too deeply to parse"
+
+
 def _try_parse(source: str) -> ast.Module | None:
     try:
         return ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, RecursionError, MemoryError):
         return None
 
 
@@ -653,6 +659,8 @@ def source_ranges_for_file(db: Database, path: str) -> FileSourceRangesPayload:
     document = DocumentMap(source)
     try:
         tree = ast.parse(source)
+    except (RecursionError, MemoryError):
+        return ((), (), None)
     except SyntaxError as exc:
         if exc.lineno is None:
             return ((), (), None)
@@ -788,6 +796,8 @@ def syntax_diagnostics_for_file(db: Database, path: str) -> tuple[DiagnosticPayl
         return (("source-decode-error", decode_error, None, None),)
     try:
         ast.parse(source)
+    except (RecursionError, MemoryError):
+        return (("syntax-error", _NESTED_TOO_DEEPLY, None, None),)
     except SyntaxError as exc:
         return (
             (

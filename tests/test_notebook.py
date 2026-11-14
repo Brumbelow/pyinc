@@ -397,6 +397,48 @@ def test_notebook_non_python_cell_is_distinguishable_from_a_syntax_error(tmp_pat
     assert result.cells[0].imports == ()
 
 
+# The unary chain overflows the parser's own stack, and ast.parse raises
+# MemoryError. The binary chain parses, but building its tree exhausts the
+# interpreter stack, and ast.parse raises RecursionError. Both lengths are
+# several times the depth at which 3.11 and 3.14 give up.
+@pytest.mark.parametrize(
+    "expression", ["-" * 100_000 + "1", "1+" * 200_000 + "1"], ids=["unary", "binary"]
+)
+def test_notebook_reports_a_cell_nested_too_deeply_to_parse(
+    expression: str, tmp_path: Path
+) -> None:
+    deep = f"value = {expression}\n"
+    nb = _notebook(
+        [
+            {"cell_type": "code", "source": deep},
+            {"cell_type": "code", "source": "%matplotlib inline\n" + deep},
+        ]
+    )
+    path = tmp_path / "nb.ipynb"
+    _write_notebook(path, nb)
+
+    result = notebook_analysis(Database(), str(path))
+
+    assert result.diagnostics == (
+        NotebookDiagnostic(
+            code="syntax-error",
+            message="source is nested too deeply to parse",
+            cell_index=0,
+            range=None,
+        ),
+        NotebookDiagnostic(
+            code="notebook-non-python-cell",
+            message=(
+                "cell is not Python after neutralizing notebook syntax: "
+                "source is nested too deeply to parse"
+            ),
+            cell_index=1,
+            range=None,
+        ),
+    )
+    assert [cell.imports for cell in result.cells] == [(), ()]
+
+
 def test_notebook_decode_error(tmp_path: Path) -> None:
     path = tmp_path / "broken.ipynb"
     path.write_text("{not json", encoding="utf-8")

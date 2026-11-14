@@ -794,7 +794,7 @@ class _ScopeBuilder:
             return
         try:
             parsed = ast.parse(annotation.value, mode="eval")
-        except SyntaxError:
+        except (SyntaxError, RecursionError, MemoryError):
             return
         inner_document = DocumentMap(annotation.value)
         base_character = full.start.character + value_start
@@ -989,7 +989,10 @@ def scope_tree_payload(db: Database, path: str) -> ScopeTreePayload:
     source = source_text(db, path)
     try:
         parsed = ast.parse(source, filename=path)
-    except SyntaxError:
+    except (SyntaxError, RecursionError, MemoryError):
+        # RecursionError and MemoryError mean the source nests deeper than the
+        # parser's stack allows. Such a file gets the empty tree a syntax
+        # error gets.
         return path, tuple(), tuple(), tuple()
     result = _ScopeBuilder(path, source, parsed).build()
     scopes = tuple(

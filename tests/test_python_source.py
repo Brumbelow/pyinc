@@ -233,6 +233,32 @@ def test_file_analysis_reports_syntax_errors(mode: str, tmp_path: Path) -> None:
     assert analysis.diagnostics[0].range.start.line == 0
 
 
+# The unary chain overflows the parser's own stack, and ast.parse raises
+# MemoryError. The binary chain parses, but building its tree exhausts the
+# interpreter stack, and ast.parse raises RecursionError. Both lengths are
+# several times the depth at which 3.11 and 3.14 give up.
+@pytest.mark.parametrize(
+    "expression", ["-" * 100_000 + "1", "1+" * 200_000 + "1"], ids=["unary", "binary"]
+)
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_file_analysis_reports_source_nested_too_deeply_to_parse(
+    mode: str, expression: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "deep.py"
+    path.write_text(f"value = {expression}\n", encoding="utf-8")
+    db = Database(mode=mode)
+
+    analysis = file_analysis(db, path)
+    workspace = workspace_analysis(db, tmp_path)
+
+    assert analysis.imports == ()
+    assert analysis.definitions == ()
+    assert [(item.code, item.message, item.range) for item in analysis.diagnostics] == [
+        ("syntax-error", "source is nested too deeply to parse", None)
+    ]
+    assert [module.diagnostics for module in workspace.modules] == [analysis.diagnostics]
+
+
 def test_file_analysis_reports_invalid_source_encoding(tmp_path: Path) -> None:
     path = tmp_path / "broken.py"
     path.write_bytes(b"# coding: not-a-real-codec\nvalue = 1\n")

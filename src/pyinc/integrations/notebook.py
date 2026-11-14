@@ -267,6 +267,19 @@ def _neutralize_notebook_syntax(source: str) -> tuple[str, bool]:
     return "".join(rewritten), changed
 
 
+# Source nested deeper than the parser's stack allows makes ast.parse raise
+# MemoryError or RecursionError, depending on the interpreter version and the
+# shape of the nesting. Both are reported as a syntax error with this fixed text.
+_NESTED_TOO_DEEPLY = "source is nested too deeply to parse"
+
+
+def _parse_python(source: str) -> ast.Module:
+    try:
+        return ast.parse(source)
+    except (RecursionError, MemoryError):
+        raise SyntaxError(_NESTED_TOO_DEEPLY) from None
+
+
 def _parse_cell_source(
     source: str,
 ) -> tuple[ast.Module | None, str, tuple[str, SyntaxError] | None]:
@@ -278,13 +291,13 @@ def _parse_cell_source(
     Python syntax error.
     """
     try:
-        return ast.parse(source), source, None
+        return _parse_python(source), source, None
     except SyntaxError as python_error:
         neutralized, rewritten = _neutralize_notebook_syntax(source)
         if not rewritten:
             return None, source, ("syntax-error", python_error)
         try:
-            return ast.parse(neutralized), neutralized, None
+            return _parse_python(neutralized), neutralized, None
         except SyntaxError as exc:
             return None, neutralized, ("notebook-non-python-cell", exc)
 
