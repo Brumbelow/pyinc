@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -178,12 +179,75 @@ _URL_REQ_PAT = (
     r"$"
 )
 
-_FILE_REF_PAT = r"^(?:-r|--requirement)\s+(.+)$"
-_CONSTRAINT_REF_PAT = r"^(?:-c|--constraint)\s+(.+)$"
-_EDITABLE_PAT = r"^(?:-e|--editable)\s+(.+)$"
-_INDEX_URL_PAT = r"^--index-url\s+(.+)$"
-_EXTRA_INDEX_PAT = r"^--extra-index-url\s+(.+)$"
-_FIND_LINKS_PAT = r"^(?:-f|--find-links)\s+(.+)$"
+# pip reads option lines with optparse. A long option takes its value after
+# whitespace or "=", and a short option also takes it attached, as in
+# "-rbase.txt".
+_FILE_REF_PAT = r"^(?:-r\s*|--requirement(?:\s+|=))(.+)$"
+_CONSTRAINT_REF_PAT = r"^(?:-c\s*|--constraint(?:\s+|=))(.+)$"
+_EDITABLE_PAT = r"^(?:-e\s*|--editable(?:\s+|=))(.+)$"
+_INDEX_URL_PAT = r"^(?:-i\s*|--(?:index|pypi)-url(?:\s+|=))(.+)$"
+_EXTRA_INDEX_PAT = r"^--extra-index-url(?:\s+|=)(.+)$"
+_FIND_LINKS_PAT = r"^(?:-f\s*|--find-links(?:\s+|=))(.+)$"
+
+# The other options pip accepts in a requirements file. This parser reads
+# nothing from them, so their lines are skipped. The first group takes a
+# value and the second is a flag.
+_SKIPPED_OPTION_PAT = (
+    r"^(?:"
+    r"(?:-C\s*|--(?:config-settings|hash|use-feature|all-releases|only-final"
+    r"|no-binary|only-binary|trusted-host)(?:\s+|=))\S"
+    r"|--(?:no-index|no-require-hashes)(?:\s|$)"
+    r")"
+)
+
+# A bare requirement line is a direct reference when pip reads it as one.
+# These are the URL schemes pip accepts, and the archive suffixes that make
+# pip read a name as a file.
+_URL_SCHEMES = (
+    "http",
+    "https",
+    "file",
+    "ftp",
+    "bzr+http",
+    "bzr+https",
+    "bzr+ssh",
+    "bzr+sftp",
+    "bzr+ftp",
+    "bzr+lp",
+    "bzr+file",
+    "git+http",
+    "git+https",
+    "git+ssh",
+    "git+git",
+    "git+file",
+    "hg+file",
+    "hg+http",
+    "hg+https",
+    "hg+ssh",
+    "hg+static-http",
+    "svn+ssh",
+    "svn+http",
+    "svn+https",
+    "svn+svn",
+    "svn+file",
+)
+_ARCHIVE_SUFFIXES = (
+    ".zip",
+    ".whl",
+    ".tar.bz2",
+    ".tbz",
+    ".tar.gz",
+    ".tgz",
+    ".tar",
+    ".tar.xz",
+    ".txz",
+    ".tlz",
+    ".tar.lz",
+    ".tar.lzma",
+)
+
+# A project name followed by a version operator starts a specifier.
+_SPECIFIER_START_PAT = r"^[A-Za-z0-9][A-Za-z0-9._-]*\s*(?:\[[^\]]*\])?\s*(?:[<>=!~]=|[<>])"
 
 
 def _valid_file_reference_path(path: str) -> bool:
@@ -261,14 +325,62 @@ def _strip_requirement_options(line: str) -> str:
     pip's requirements-file grammar puts options such as ``--hash=...``
     after the requirement, separated by whitespace. pip-compile emits them on
     backslash continuation lines, which ``_logical_lines`` joins back into
-    the requirement line. A PEP 508 requirement never contains a ``--``
-    token, so everything from the first whitespace-delimited ``--`` token
-    onward is option text.
+    the requirement line. pip ends the requirement at the first
+    whitespace-delimited token that starts with ``-``, so everything from
+    that token onward is option text.
     """
-    match = re.search(r"(?:^|\s)--", line)
+    match = re.search(r"(?:^|\s)-", line)
     if match is None:
         return line
     return line[: match.start()].rstrip()
+
+
+def _direct_reference(line: str) -> tuple[str, tuple[str, ...], str] | None:
+    """Return ``(target, extras, markers)`` for a bare URL or path line.
+
+    pip reads a line as a URL when it starts with a scheme pip installs from,
+    and then only ``"; "`` starts its markers. Otherwise the markers start at
+    ``;``. pip reads the text before them as a file when it ends in an archive
+    suffix, and as a directory when it holds a path separator or starts with
+    a dot and that directory exists. A trailing ``[extras]`` on a path is kept
+    apart from it. When that text holds ``@`` and the part before the first
+    ``@`` does not look like a path, pip reads it as ``name @ url`` instead,
+    so it is ``None``. This parse reads text only, so it takes other text with
+    a separator or a leading dot as a directory unless it starts like a
+    version specifier. ``/`` is the one separator, as for pip outside Windows,
+    so the answer is the same on every platform. pip reads a line that starts
+    with ``-`` as options, so it is ``None``. Any other line is ``None`` too.
+    """
+    if line.startswith("-"):
+        return None
+    scheme = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*):", line)
+    if scheme is not None and scheme.group(1).lower() in _URL_SCHEMES:
+        url, _, url_markers = line.partition("; ")
+        return url.strip(), (), url_markers.strip()
+    target, _, markers = line.partition(";")
+    target = target.strip()
+    before_at, at, _ = target.partition("@")
+    if at and "/" not in before_at and not before_at.startswith("."):
+        return None
+    extras: tuple[str, ...] = ()
+    extras_match = re.match(r"^(.+)\[([^\]]+)\]$", target)
+    if extras_match is not None:
+        target = extras_match.group(1)
+        extras = tuple(e.strip() for e in extras_match.group(2).split(",") if e.strip())
+    # pip takes the last extension, with a ".tar" before it, so "foo.tar.zip"
+    # ends in ".tar.zip" and is no archive.
+    base, suffix = posixpath.splitext(target)
+    if base.lower().endswith(".tar"):
+        suffix = base[-4:] + suffix
+    if suffix.lower() not in _ARCHIVE_SUFFIXES:
+        if not ("/" in target or target.startswith(".")):
+            return None
+        # pip falls back to a specifier when no such directory exists. A
+        # project name and a version operator start one, and `===` lets it
+        # hold any text, a separator included.
+        if re.match(_SPECIFIER_START_PAT, target):
+            return None
+    return target, extras, markers.strip()
 
 
 def _parse_requirement_line(line: str, lineno: int) -> RequirementPayload | None:
@@ -286,6 +398,12 @@ def _parse_requirement_line(line: str, lineno: int) -> RequirementPayload | None
         markers = (url_match.group("markers") or "").strip()
         url = url_match.group("url").strip()
         return (name, line.strip(), lineno, extras, f"@ {url}", markers, False)
+
+    # A bare URL or path names no project, so the target stands as the name.
+    direct = _direct_reference(stripped)
+    if direct is not None:
+        target, extras, markers = direct
+        return (target, line.strip(), lineno, extras, f"@ {target}", markers, False)
 
     match = re.match(_REQ_PAT, stripped)
     if match is None:
@@ -393,7 +511,17 @@ def _parse_diagnostics(text: str) -> tuple[DiagnosticPayload, ...]:
         ):
             results.append(("unparseable-line", f"line {lineno}: {stripped}"))
             continue
-        # Skip known option and directive lines.
+        # Skip known option and directive lines, in each form pip accepts.
+        # Each pattern is matched against the text its parser reads.
+        if reference_match is not None or re.match(_EDITABLE_PAT, stripped):
+            continue
+        if (
+            re.match(_INDEX_URL_PAT, stripped)
+            or re.match(_EXTRA_INDEX_PAT, stripped)
+            or re.match(_FIND_LINKS_PAT, stripped)
+            or re.match(_SKIPPED_OPTION_PAT, stripped)
+        ):
+            continue
         if stripped.startswith(
             (
                 "-r ",

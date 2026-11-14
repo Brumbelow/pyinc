@@ -159,15 +159,38 @@ It parses names, extras, version text, markers, editable/direct URL lines,
 continuations, index/find-links directives, `-r` requirement references, and
 `-c` constraint references. Per-requirement options (for example the
 `--hash=...` lines `pip-compile --generate-hashes` emits) are split off the
-requirement and kept out of its version text. The options themselves are
-ignored and never verified. Deep analysis follows in-root `-r` files, with
-cycle and missing-file diagnostics.
+requirement and kept out of its version text. As in pip, a requirement ends
+at the first whitespace-delimited token that starts with `-`, so
+`requests -r ./other.txt` is the requirement `requests` and names no file.
+The options themselves are ignored and never verified. Deep analysis follows
+in-root `-r` files, with cycle and missing-file diagnostics.
+An option is read in each form pip accepts: `--name value`, `--name=value`,
+and a short name with its value attached, as in `-rbase.txt`. A bare URL or
+local path line is a direct reference. Its name is the target as written, and
+its version text is `@` and the target. The other options pip accepts, such as
+`--no-index` and `--config-settings`, are skipped with no diagnostic. A line
+that starts with any other option is an `unparseable-line`. The exception is a
+line whose text starts with `--pre`, `--no-binary`, `--only-binary`,
+`--require-hashes`, `--trusted-host`, `--hash=`, `--no-deps` or
+`--global-option`. That line is skipped whatever follows, so `--prefix=/opt`
+and `--no-deps` are skipped too.
 
 ### Limits
 
 Marker evaluation is separate. It never fetches URLs or VCS sources, solves
 versions, or applies constraints recursively. Constraint references are
 recorded but not followed. Project-root escapes are diagnosed.
+A bare line is read as a path by its text alone, with no disk read: an archive
+suffix such as `.whl`, or a `/` or leading dot unless the line starts like a
+version specifier. The archive suffix is the last extension, with a `.tar`
+before it, as pip takes it, so `foo.tar.zip` is a project name. A line whose
+text before its first `@` has no `/` and no leading dot is never a path,
+because pip reads it as `name @ url`. A backslash is not a separator, as for
+pip outside Windows, so a Windows path written with backslashes is read as a
+path only by an archive suffix or a leading dot.
+A direct reference takes no name from a wheel filename or an `#egg=` fragment.
+An abbreviated long option, which pip expands, is an `unparseable-line`, except
+one that starts with `--pre`, such as `--prefer`, which is skipped.
 
 ## Requirement evaluation
 

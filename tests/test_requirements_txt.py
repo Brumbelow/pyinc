@@ -420,6 +420,157 @@ def test_requirements_analysis_parses_url_requirements(tmp_path: Path) -> None:
     assert "https://example.com/mypackage-1.0.tar.gz" in req.version_spec
 
 
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_requirements_analysis_reads_equals_and_attached_option_forms(
+    mode: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text(
+        "--index-url=https://index.example/simple\n"
+        "-i https://short.example/simple\n"
+        "-ihttps://attached.example/simple\n"
+        "--pypi-url=https://p/simple\n"
+        "--extra-index-url=https://extra.example/simple\n"
+        "--find-links=./wheels\n"
+        "-f./more-wheels\n"
+        "--requirement=other.txt\n"
+        "-rother2.txt\n"
+        "--constraint=c.txt\n"
+        "-cc2.txt\n"
+        "--editable=./pkg\n"
+        "-e./other-pkg\n",
+        encoding="utf-8",
+    )
+
+    result = requirements_analysis(Database(mode=mode), path)
+
+    assert [(item.kind, item.url) for item in result.index_directives] == [
+        ("index-url", "https://index.example/simple"),
+        ("index-url", "https://short.example/simple"),
+        ("index-url", "https://attached.example/simple"),
+        ("index-url", "https://p/simple"),
+        ("extra-index-url", "https://extra.example/simple"),
+        ("find-links", "./wheels"),
+        ("find-links", "./more-wheels"),
+    ]
+    assert [(item.kind, item.path) for item in result.file_references] == [
+        ("requirement", "other.txt"),
+        ("requirement", "other2.txt"),
+        ("constraint", "c.txt"),
+        ("constraint", "c2.txt"),
+    ]
+    assert [(item.name, item.is_editable) for item in result.requirements] == [
+        ("./pkg", True),
+        ("./other-pkg", True),
+    ]
+    assert result.diagnostics == ()
+
+
+def test_requirements_analysis_skips_pip_options_it_does_not_model(tmp_path: Path) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text(
+        "--no-index\n"
+        "--use-feature=x\n"
+        "--use-feature truststore\n"
+        "--config-settings k=v\n"
+        "-Ck=v\n"
+        "--hash sha256:aaaa\n"
+        "--no-require-hashes\n"
+        "--only-final=:all:\n"
+        "--all-releases :all:\n"
+        "--trusted-host=pypi.example\n"
+        "requests==2.31.0 -C k=v\n"
+        "--use-feature\n"
+        "--not-a-pip-option\n"
+        "-x ./foo\n",
+        encoding="utf-8",
+    )
+
+    result = requirements_analysis(Database(), path)
+
+    assert [(item.name, item.version_spec) for item in result.requirements] == [
+        ("requests", "==2.31.0")
+    ]
+    assert result.file_references == ()
+    assert result.index_directives == ()
+    assert result.diagnostics == (
+        ("unparseable-line", "line 12: --use-feature"),
+        ("unparseable-line", "line 13: --not-a-pip-option"),
+        ("unparseable-line", "line 14: -x ./foo"),
+    )
+
+
+def test_requirements_analysis_records_bare_url_and_path_lines_as_direct_references(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text(
+        "https://host/pkg-1.0-py3-none-any.whl\n"
+        "./local/path\n"
+        "git+https://x/y.git#egg=y\n"
+        "local/path\n"
+        ".[test]\n"
+        "dist/pkg-2.0.tar.gz --hash=sha256:aaaa\n"
+        "pkg-3.0-py3-none-any.whl\n"
+        'https://host/other-1.0-py3-none-any.whl ; python_version >= "3"\n'
+        'requests; platform_machine == "a/b"\n'
+        "foo===1/2\n"
+        "https://host/x-1.0-py3-none-any.whl;python_version>'3'\n"
+        "requests -r ./other.txt\n"
+        "foo.tar.zip\n"
+        "foo [bar] @ https://host/foo-1.0-py3-none-any.whl\n"
+        "foo [bar] @ https://host/x/y\n",
+        encoding="utf-8",
+    )
+
+    result = requirements_analysis(Database(), path)
+
+    wheel = "https://host/pkg-1.0-py3-none-any.whl"
+    marked = "https://host/other-1.0-py3-none-any.whl"
+    unspaced = "https://host/x-1.0-py3-none-any.whl;python_version>'3'"
+    assert [
+        (item.name, item.version_spec, item.extras, item.markers, item.is_editable)
+        for item in result.requirements
+    ] == [
+        (wheel, f"@ {wheel}", (), "", False),
+        ("./local/path", "@ ./local/path", (), "", False),
+        ("git+https://x/y.git#egg=y", "@ git+https://x/y.git#egg=y", (), "", False),
+        ("local/path", "@ local/path", (), "", False),
+        (".", "@ .", ("test",), "", False),
+        ("dist/pkg-2.0.tar.gz", "@ dist/pkg-2.0.tar.gz", (), "", False),
+        ("pkg-3.0-py3-none-any.whl", "@ pkg-3.0-py3-none-any.whl", (), "", False),
+        (marked, f"@ {marked}", (), 'python_version >= "3"', False),
+        ("requests", "", (), 'platform_machine == "a/b"', False),
+        ("foo", "===1/2", (), "", False),
+        (unspaced, f"@ {unspaced}", (), "", False),
+        ("requests", "", (), "", False),
+        ("foo_tar_zip", "", (), "", False),
+    ]
+    assert result.requirements[0].raw_line == wheel
+    assert result.requirements[5].raw_line == "dist/pkg-2.0.tar.gz --hash=sha256:aaaa"
+    assert result.file_references == ()
+    assert result.diagnostics == (
+        ("unparseable-line", "line 14: foo [bar] @ https://host/foo-1.0-py3-none-any.whl"),
+        ("unparseable-line", "line 15: foo [bar] @ https://host/x/y"),
+    )
+
+
+def test_deep_requirements_follow_attached_and_equals_references(tmp_path: Path) -> None:
+    (tmp_path / "base.in").write_text("base-package==1\n", encoding="utf-8")
+    (tmp_path / "extra.in").write_text("extra-package==2\n", encoding="utf-8")
+    main = tmp_path / "requirements.txt"
+    main.write_text("-rbase.in\n--requirement=extra.in\nmain-package==3\n", encoding="utf-8")
+
+    deep = deep_requirements_analysis(Database(), main)
+
+    assert [item.name for item in deep.requirements] == [
+        "base_package",
+        "extra_package",
+        "main_package",
+    ]
+    assert deep.diagnostics == ()
+
+
 # ---------------------------------------------------------------------------
 # Backdating
 # ---------------------------------------------------------------------------
