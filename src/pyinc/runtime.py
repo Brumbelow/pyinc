@@ -131,6 +131,9 @@ _DEFAULT_SEMANTIC_EQUALITY_VERSION = 1
 _MISSING_SNAPSHOT = object()
 _EMPTY_CELL_OBSERVATION = object()
 _UNBOUND_GLOBAL_OBSERVATION = object()
+# A class whose module binding cannot be looked up. The payload's anchor raises
+# for such a class, so no stored observation holds the class itself there.
+_UNRESOLVED_TYPE_BINDING = object()
 # Answer for an unbound captured module attribute. A single object keeps the
 # guard's identity comparison stable while the path stays empty, and makes it
 # fail once anything is bound there. A chain the accessed-path fold found empty
@@ -140,6 +143,10 @@ _MISSING_MODULE_ATTRIBUTE = object()
 # Not a hexadecimal digest, so it never equals a stored one and always makes
 # the memo guard fall through to a full recompute.
 _UNREADABLE_RESOURCE_DIGEST = "unreadable-resource"
+# How many resource objects one database keeps identities for. Code that
+# builds a new resource object per read misses every time, at the cost of a
+# fresh derivation, and the oldest entry makes room.
+_RESOURCE_IDENTITY_MEMO_LIMIT = 256
 # Implementation digests of the kernel's own fixed adapters, held for the
 # process. Such a digest folds only the adapter's class (its two method bodies,
 # its type payload, the bytes of its module) and the interpreter build. An
@@ -830,6 +837,35 @@ class _ModuleSourceReads:
 
     def live(self) -> bool:
         return not self.ended and self.owner is _current_thread_token()
+
+
+@dataclass(frozen=True, eq=False)
+class _IdentityMemoEntry:
+    """What a memoized identity read, kept so a later read can check it still holds.
+
+    One shape serves the query fingerprint memo and the resource identity memo,
+    and `Database._identity_memo_holds` checks both, so an arm added for one
+    reaches the other. The fields after `digest` belong to the resource memo.
+    A query entry leaves them at their defaults.
+    """
+
+    runtime_build: tuple[Any, ...]
+    observation: Any
+    # Each resource method the fold resolved: the owner, the method name, and
+    # what `getattr(method, "__func__", method)` gave.
+    methods: tuple[tuple[Any, str, Any], ...]
+    method_observation: tuple[Any, ...]
+    attributes: tuple[tuple[ModuleType, tuple[str, ...], Any], ...]
+    attribute_observation: tuple[Any, ...]
+    modules: tuple[tuple[ModuleType, Any], ...]
+    resources: tuple[tuple[Any, str], ...]
+    digest: str
+    # Held strongly, so no other object can take its id while the entry lives.
+    resource: Any = None
+    frozen_digest: str = ""
+    type_digest: str = ""
+    type_reusable: bool = False
+    configuration_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -1834,6 +1870,12 @@ class Database:
         self._resource_fingerprint_stack: ContextVar[tuple[int, ...]] = ContextVar(
             "pyinc_resource_fingerprint_stack", default=()
         )
+        # The resources whose memo guard is running. A guard re-reads the
+        # resources the memoized fold reached, and two resources can reach
+        # each other, so a resource on this stack is read without its memo.
+        self._resource_guard_stack: ContextVar[tuple[int, ...]] = ContextVar(
+            "pyinc_resource_guard_stack", default=()
+        )
         self._type_fingerprint_stack: ContextVar[tuple[int, ...]] = ContextVar(
             "pyinc_type_fingerprint_stack", default=()
         )
@@ -1861,18 +1903,15 @@ class Database:
         self._query_timings: dict[NodeKey, _TimingAggregate] = {}
         self._state_lock = threading.RLock()
         self._query_registry: dict[str, Any] = {}
-        self._query_fingerprint_memo: weakref.WeakKeyDictionary[
-            Any,
-            tuple[
-                tuple[Any, ...],
-                Any,
-                str,
-                tuple[tuple[ModuleType, Any], ...],
-                tuple[tuple[Any, str], ...],
-                tuple[tuple[ModuleType, tuple[str, ...], Any], ...],
-                tuple[Any, ...],
-            ],
-        ] = weakref.WeakKeyDictionary()
+        self._query_fingerprint_memo: weakref.WeakKeyDictionary[Any, _IdentityMemoEntry] = (
+            weakref.WeakKeyDictionary()
+        )
+        # Keyed by id(resource). Each entry holds its resource, so the id
+        # cannot pass to another object while the entry lives. A weak key
+        # would never die, because the definition observation pins the
+        # resource, and it would match equal resources as one. Insertion
+        # order is eviction order.
+        self._resource_identity_memo: dict[int, _IdentityMemoEntry] = {}
         self._fingerprint_module_collector: ContextVar[dict[int, ModuleType] | None] = ContextVar(
             "pyinc_fingerprint_module_collector", default=None
         )
@@ -1881,6 +1920,10 @@ class Database:
         ] = ContextVar("pyinc_fingerprint_attribute_collector", default=None)
         self._fingerprint_resource_collector: ContextVar[list[tuple[Any, str]] | None] = ContextVar(
             "pyinc_fingerprint_resource_collector", default=None
+        )
+        # Each resource method a fold resolved, as (resource, name, callable).
+        self._fingerprint_method_collector: ContextVar[list[tuple[Any, str, Any]] | None] = (
+            ContextVar("pyinc_fingerprint_method_collector", default=None)
         )
         # The module files the running `_query_fingerprint` has hashed so far.
         # See `_module_source_digest`.
@@ -4477,7 +4520,7 @@ class Database:
     def _resource_key(self, resource: Any, parameter: Any) -> NodeKey:
         frozen_parameter = self._freeze_value(parameter)
         parameter_digest = fingerprint_snapshot(frozen_parameter)
-        resource_identity = fingerprint_snapshot(self._resource_identity_payload(resource))
+        resource_identity = self._resource_identity_fingerprint(resource)
         parameter_type_digest = fingerprint_snapshot(
             (
                 "resource-parameter-types-v3",
@@ -4908,41 +4951,25 @@ class Database:
 
     def _memoized_query_fingerprint(self, query: Any) -> str:
         cached = self._query_fingerprint_memo.get(query)
-        runtime_build = self._runtime_build_payload()
-        definition_observation = self._query_definition_observation(query)
-        if (
-            cached is not None
-            and cached[0] == runtime_build
-            and self._definition_observation_matches(cached[1], definition_observation)
-            # Cheapest arm first: re-resolving a chain is a lookup per path
-            # segment, a module stamp hashes a file, and a resource digest
-            # re-runs identity(). Every arm but the last is a pure read, so
-            # among those the order only decides what a mismatch costs before
-            # it is found. The resource arm goes last because it can refuse,
-            # and a moved resource means the resource redefined itself only
-            # once everything else about the query holds still.
-            and all(
-                self._resolve_module_path_target(module, path) is expected
-                for module, path, expected in cached[5]
-            )
-            # Reads the recorded targets, which the arm above proved are still
-            # the objects those chains name.
-            and self._definition_observation_matches(
-                cached[6], self._module_function_target_observation(cached[5])
-            )
-            and all(
-                self._module_observation_stamp(module) == expected for module, expected in cached[3]
-            )
-            and self._resource_identities_hold(cached[4])
+        if cached is not None and self._identity_memo_holds(
+            cached, query, configuration_holds=None, resources_hold=self._resource_identities_hold
         ):
-            return cached[2]
+            return cached.digest
 
+        # Taken before the fold, so a fold that moves what it observes leaves
+        # an observation the next guard cannot match. The guard above built
+        # its own, and the family it used has already seen the methods it
+        # checked, so this one starts from a family of its own.
+        runtime_build = self._runtime_build_payload()
+        observe_value, definition_observation = self._query_definition_observation(query)
         modules: dict[int, ModuleType] = {}
         resources: list[tuple[Any, str]] = []
         attributes: list[tuple[ModuleType, tuple[str, ...], Any]] = []
+        methods: list[tuple[Any, str, Any]] = []
         collector_token = self._fingerprint_module_collector.set(modules)
         resource_token = self._fingerprint_resource_collector.set(resources)
         attribute_token = self._fingerprint_attribute_collector.set(attributes)
+        method_token = self._fingerprint_method_collector.set(methods)
         cacheable_token = self._fingerprint_cacheable.set(True)
         try:
             result = fingerprint_snapshot(
@@ -4957,9 +4984,121 @@ class Database:
         finally:
             cacheable = self._fingerprint_cacheable.get()
             self._fingerprint_cacheable.reset(cacheable_token)
+            self._fingerprint_method_collector.reset(method_token)
             self._fingerprint_attribute_collector.reset(attribute_token)
             self._fingerprint_resource_collector.reset(resource_token)
             self._fingerprint_module_collector.reset(collector_token)
+        if cacheable:
+            self._query_fingerprint_memo[query] = self._identity_memo_entry(
+                result,
+                runtime_build=runtime_build,
+                observe_value=observe_value,
+                observation=definition_observation,
+                modules=modules,
+                resources=resources,
+                attributes=attributes,
+                methods=methods,
+            )
+        else:
+            self._query_fingerprint_memo.pop(query, None)
+        return result
+
+    def _identity_memo_holds(
+        self,
+        entry: _IdentityMemoEntry,
+        subject: Any,
+        *,
+        configuration_holds: Callable[[], bool] | None,
+        resources_hold: Callable[[tuple[tuple[Any, str], ...]], bool],
+    ) -> bool:
+        """Check that everything a memoized identity read still reads the same.
+
+        The one guard behind the query fingerprint memo and the resource
+        identity memo. `subject` is the query or the resource the entry
+        describes. `configuration_holds` re-reads a resource's own
+        configuration, and the query memo has none. `resources_hold` re-reads
+        the resources the fold reached.
+
+        Every arm but the last is a pure read, and an exception inside one
+        counts as a miss. The caller then derives the identity afresh, which
+        raises where a fresh database raises. The resource arm goes last
+        because the query memo's version can refuse, and a moved resource means
+        the resource redefined itself only once everything else holds still.
+        """
+
+        try:
+            if entry.runtime_build != self._runtime_build_payload():
+                return False
+            observe_value, _observe_function = self._definition_observers()
+            if not self._definition_observation_matches(entry.observation, observe_value(subject)):
+                return False
+            # The fold reads each resource method through getattr. A slot, a
+            # descriptor or a class attribute can hand back another callable
+            # while every object the observation pins stays where it was. So
+            # each method is resolved again, compared by identity, and
+            # observed in the same family, where a callable the walk above
+            # already reached costs one lookup.
+            for owner, name, expected in entry.methods:
+                method = getattr(owner, name, None)
+                if getattr(method, "__func__", method) is not expected:
+                    return False
+            if not self._definition_observation_matches(
+                entry.method_observation,
+                tuple(observe_value(target) for _owner, _name, target in entry.methods),
+            ):
+                return False
+            # Cheapest arm first: re-resolving a chain is a lookup per path
+            # segment, a module stamp hashes a file, and a resource digest
+            # re-runs identity(). Among the pure reads the order only decides
+            # what a mismatch costs before it is found.
+            if not all(
+                self._resolve_module_path_target(module, path) is expected
+                for module, path, expected in entry.attributes
+            ):
+                return False
+            # Reads the recorded targets, which the arm above proved are still
+            # the objects those chains name.
+            if not self._definition_observation_matches(
+                entry.attribute_observation,
+                self._module_function_target_observation(entry.attributes),
+            ):
+                return False
+            if not all(
+                self._module_observation_stamp(module) == expected
+                for module, expected in entry.modules
+            ):
+                return False
+            if configuration_holds is not None and not configuration_holds():
+                return False
+        except Exception:
+            return False
+        return resources_hold(entry.resources)
+
+    def _identity_memo_entry(
+        self,
+        digest: str,
+        *,
+        runtime_build: tuple[Any, ...],
+        observe_value: Callable[[Any], Any],
+        observation: Any,
+        modules: dict[int, ModuleType],
+        resources: list[tuple[Any, str]],
+        attributes: list[tuple[ModuleType, tuple[str, ...], Any]],
+        methods: list[tuple[Any, str, Any]],
+        resource: Any = None,
+        frozen_digest: str = "",
+        type_digest: str = "",
+        type_reusable: bool = False,
+        configuration_digest: str = "",
+    ) -> _IdentityMemoEntry:
+        """Build the entry a fold's collectors describe, for either memo.
+
+        `observe_value` is the family that built `observation`, and the
+        resolved methods are observed in it after the fold, as the guard
+        observes them. A resource entry leaves its own resource out of the
+        nested resources, because its configuration arm reads that one.
+        """
+
         module_observations = tuple(
             (module, self._module_observation_stamp(module))
             for _module_id, module in sorted(modules.items(), key=lambda item: item[1].__name__)
@@ -4969,6 +5108,8 @@ class Database:
         # and the guard skips the repeat re-reads.
         deduped_resources: dict[int, tuple[Any, str]] = {}
         for observed_resource, observed_digest in resources:
+            if observed_resource is resource:
+                continue
             deduped_resources.setdefault(id(observed_resource), (observed_resource, observed_digest))
         # One entry per (module, path) chain. The same chain folded from
         # several slots of one walk reads the same live target every time, so
@@ -4984,19 +5125,30 @@ class Database:
                 (observed_module, observed_path, observed_target),
             )
         attribute_records = tuple(deduped_attributes.values())
-        if cacheable:
-            self._query_fingerprint_memo[query] = (
-                runtime_build,
-                definition_observation,
-                result,
-                module_observations,
-                tuple(deduped_resources.values()),
-                attribute_records,
-                self._module_function_target_observation(attribute_records),
-            )
-        else:
-            self._query_fingerprint_memo.pop(query, None)
-        return result
+        # One record per (resource, method name), for the same reason. The
+        # records hold the resources, so no id is reused while this keys on one.
+        deduped_methods: dict[tuple[int, str], tuple[Any, str, Any]] = {}
+        for owner, name, target in methods:
+            deduped_methods.setdefault((id(owner), name), (owner, name, target))
+        method_records = tuple(deduped_methods.values())
+        return _IdentityMemoEntry(
+            runtime_build=runtime_build,
+            observation=observation,
+            methods=method_records,
+            method_observation=tuple(
+                observe_value(target) for _owner, _name, target in method_records
+            ),
+            attributes=attribute_records,
+            attribute_observation=self._module_function_target_observation(attribute_records),
+            modules=module_observations,
+            resources=tuple(deduped_resources.values()),
+            digest=digest,
+            resource=resource,
+            frozen_digest=frozen_digest,
+            type_digest=type_digest,
+            type_reusable=type_reusable,
+            configuration_digest=configuration_digest,
+        )
 
     def _query_handle_state_payload(self, query: Any, seen_functions: builtins.set[int]) -> Any:
         """Fold the Query handle's own mutable surface into query identity.
@@ -5233,25 +5385,41 @@ class Database:
         failure answers with a value no stored digest can equal, so a resource
         that has become unreadable forces the full recompute and no unchecked
         fingerprint is served. The read is kept for the rest of the request.
+
+        The configuration is read once. The resource identity memo answers
+        from it while its guard holds, and fills from it otherwise.
         """
 
         cache = self._request_resource_digests
         try:
             configuration = self._resource_configuration(resource)
-            digest = fingerprint_snapshot(
-                (
-                    freeze(configuration, adapters=self._adapters),
-                    self._resource_configuration_type_payload(configuration),
-                )
-            )
         except Exception:
             return _UNREADABLE_RESOURCE_DIGEST
+        digest: str | None = None
+        if self._resource_identity_memo_applies(resource):
+            # A fill that raises leaves the direct read below to answer, as it
+            # did before the memo existed.
+            with suppress(Exception):
+                digest = self._memoized_resource_identity(resource, configuration)[1]
+        if digest is None:
+            try:
+                digest = fingerprint_snapshot(
+                    (
+                        freeze(configuration, adapters=self._adapters),
+                        self._resource_configuration_type_payload(configuration),
+                    )
+                )
+            except Exception:
+                return _UNREADABLE_RESOURCE_DIGEST
         if cache is not None:
             cache[id(resource)] = (resource, digest)
         return digest
 
-    def _query_definition_observation(self, query: Any) -> Any:
+    def _query_definition_observation(self, query: Any) -> tuple[Callable[[Any], Any], Any]:
         """Observe the live query definition for memoized-fingerprint reuse.
+
+        Answers the observer family beside the observation, so the resource
+        methods the fold resolves are observed in the same family.
 
         The observation records object *references* for each entry, because a
         container (a `__kwdefaults__` dict or a closure cell) mutated in place
@@ -5309,7 +5477,7 @@ class Database:
         # the handle before descending, so a body that captures its own query
         # pins it there by reference and the handle is walked once.
         observe_value, _observe_function = self._definition_observers()
-        return observe_value(query)
+        return observe_value, observe_value(query)
 
     def _module_function_target_observation(
         self, records: tuple[tuple[ModuleType, tuple[str, ...], Any], ...]
@@ -5497,7 +5665,17 @@ class Database:
                 observe_type(type(cls)) if type(cls) is not type else type,
                 tuple(observe_type(base) for base in cls.__bases__),
                 tuple((name, observe_value(item)) for name, item in sorted(vars(cls).items())),
+                observe_binding(cls),
             )
+
+        def observe_binding(cls: type[Any]) -> Any:
+            # Mirrors _module_type_anchor_payload, which refuses a class its
+            # module has stopped binding. The type of an instance is reached
+            # by no name, so no other arm sees that binding move.
+            try:
+                return _live_type_binding(cls)
+            except Exception:
+                return _UNRESOLVED_TYPE_BINDING
 
         def observe_instance(value: Any) -> Any:
             if isinstance(value, ModuleType):
@@ -7675,7 +7853,7 @@ class Database:
             elif isinstance(value, Input):
                 return
             elif self._is_resource_handle(value):
-                identity = fingerprint_snapshot(self._resource_identity_payload(value))
+                identity = self._resource_identity_fingerprint(value)
                 resource_objects.setdefault(
                     f"{type(value).__module__}:{type(value).__qualname__}:{identity}",
                     value,
@@ -8623,18 +8801,237 @@ class Database:
         resource_identity = getattr(resource, "identity", None)
         return resource_identity() if callable(resource_identity) else resource
 
+    @staticmethod
+    def _resource_identity_memo_serves(resource: Any) -> bool:
+        """True for a resource whose attribute reads the memo's arms can follow.
+
+        The fold reads a resource's methods through getattr. The observation
+        and the method arm follow what object.__getattribute__ finds: the
+        class, the instance dictionary, slots and descriptors. A class with a
+        __getattribute__ of its own or a __getattr__ can answer anything. A
+        module, a class or a function used as a resource has attributes the
+        observation does not walk. Those derive their identity afresh on every
+        read, as before the memo existed.
+        """
+
+        if isinstance(resource, (ModuleType, type, FunctionType)):
+            return False
+        for klass in type(resource).__mro__:
+            namespace = vars(klass)
+            if "__getattr__" in namespace:
+                return False
+            if "__getattribute__" in namespace:
+                return klass is object
+        return False
+
+    def _resource_identity_memo_applies(self, resource: Any) -> bool:
+        """True where a read of this resource's identity may use the memo.
+
+        A fold in progress folds every resource it reaches into its own
+        collectors, which the enclosing memo's guard depends on, so a resource
+        reached inside one is folded in place. A resource whose own fold or
+        guard is running is read without the memo, which ends the recursion
+        between two resources that reach each other.
+        """
+
+        if self._fingerprint_module_collector.get() is not None:
+            return False
+        resource_id = id(resource)
+        if resource_id in self._resource_fingerprint_stack.get():
+            return False
+        if resource_id in self._resource_guard_stack.get():
+            return False
+        return self._resource_identity_memo_serves(resource)
+
+    def _resource_identity_fingerprint(self, resource: Any) -> str:
+        """The digest of a resource's whole identity, as its node key carries it."""
+
+        if not self._resource_identity_memo_applies(resource):
+            return fingerprint_snapshot(self._resource_identity_payload(resource))
+        configuration = self._resource_configuration(resource)
+        return self._memoized_resource_identity(resource, configuration)[0]
+
+    def _memoized_resource_identity(self, resource: Any, configuration: Any) -> tuple[str, str]:
+        """Answer a resource's identity digest and its configuration digest.
+
+        The first is what a resource node key carries. The second is what
+        `_resource_identity_digest` answers. Both come from the memo while its
+        guard holds, and from one fold otherwise. `configuration` is the value
+        the caller's identity() call returned, so each call site calls
+        identity() once, on a hit and on a miss.
+
+        Module files are read once for the whole answer, as in
+        `_query_fingerprint`, so the guard's stamps and a fold describe the
+        same bytes. A read set already open is joined.
+        """
+
+        reads = self._module_source_reads.get()
+        if reads is not None and reads.live():
+            return self._resource_identity_from_memo(resource, configuration)
+        reads = _ModuleSourceReads()
+        token = self._module_source_reads.set(reads)
+        try:
+            return self._resource_identity_from_memo(resource, configuration)
+        finally:
+            reads.ended = True
+            reads.digests.clear()
+            self._module_source_reads.reset(token)
+
+    def _resource_identity_from_memo(self, resource: Any, configuration: Any) -> tuple[str, str]:
+        memo = self._resource_identity_memo
+        resource_id = id(resource)
+        entry = memo.get(resource_id)
+        if entry is not None and entry.resource is resource:
+            guarded = entry
+            guard_token = self._resource_guard_stack.set(
+                self._resource_guard_stack.get() + (resource_id,)
+            )
+            try:
+                held = self._identity_memo_holds(
+                    guarded,
+                    resource,
+                    configuration_holds=lambda: self._resource_configuration_holds(
+                        guarded, resource, configuration
+                    ),
+                    resources_hold=self._resource_digests_hold,
+                )
+            finally:
+                self._resource_guard_stack.reset(guard_token)
+            if held:
+                return guarded.digest, guarded.configuration_digest
+            # A fill the guard ran for a nested resource may have evicted it.
+            memo.pop(resource_id, None)
+
+        runtime_build = self._runtime_build_payload()
+        observe_value: Callable[[Any], Any] | None
+        try:
+            # Taken before the fold, as the query memo takes its own.
+            observe_value, _observe_function = self._definition_observers()
+            observation = observe_value(resource)
+        except Exception:
+            # Nothing to check a later read against, so the fold below answers
+            # and nothing is stored.
+            observe_value = None
+            observation = None
+        modules: dict[int, ModuleType] = {}
+        resources: list[tuple[Any, str]] = []
+        attributes: list[tuple[ModuleType, tuple[str, ...], Any]] = []
+        methods: list[tuple[Any, str, Any]] = []
+        collector_token = self._fingerprint_module_collector.set(modules)
+        resource_token = self._fingerprint_resource_collector.set(resources)
+        attribute_token = self._fingerprint_attribute_collector.set(attributes)
+        method_token = self._fingerprint_method_collector.set(methods)
+        cacheable_token = self._fingerprint_cacheable.set(True)
+        try:
+            payload, frozen_configuration, configuration_type, type_reusable = (
+                self._resource_identity_fold(resource, (configuration,))
+            )
+        finally:
+            cacheable = self._fingerprint_cacheable.get()
+            self._fingerprint_cacheable.reset(cacheable_token)
+            self._fingerprint_method_collector.reset(method_token)
+            self._fingerprint_attribute_collector.reset(attribute_token)
+            self._fingerprint_resource_collector.reset(resource_token)
+            self._fingerprint_module_collector.reset(collector_token)
+        identity_digest = fingerprint_snapshot(payload)
+        configuration_digest = fingerprint_snapshot((frozen_configuration, configuration_type))
+        if cacheable and observe_value is not None and _RESOURCE_IDENTITY_MEMO_LIMIT > 0:
+            try:
+                stored = self._identity_memo_entry(
+                    identity_digest,
+                    runtime_build=runtime_build,
+                    observe_value=observe_value,
+                    observation=observation,
+                    modules=modules,
+                    resources=resources,
+                    attributes=attributes,
+                    methods=methods,
+                    resource=resource,
+                    frozen_digest=fingerprint_snapshot(frozen_configuration),
+                    type_digest=fingerprint_snapshot(configuration_type),
+                    type_reusable=type_reusable,
+                    configuration_digest=configuration_digest,
+                )
+            except Exception:
+                # A stamp or an observation that cannot be read leaves the
+                # answer standing and stores nothing.
+                pass
+            else:
+                memo[resource_id] = stored
+                while len(memo) > _RESOURCE_IDENTITY_MEMO_LIMIT:
+                    del memo[next(iter(memo))]
+        return identity_digest, configuration_digest
+
+    def _resource_configuration_holds(
+        self, entry: _IdentityMemoEntry, resource: Any, configuration: Any
+    ) -> bool:
+        """Compare the configuration a read handed in with the one the entry folded.
+
+        The frozen digest catches a value that changed, rebound or in place.
+        The type half is derived again unless the entry says a hit may reuse
+        it: the configuration was the resource itself, and every read its
+        encoding made is one the definition observation covers.
+        """
+
+        frozen_digest = fingerprint_snapshot(freeze(configuration, adapters=self._adapters))
+        if frozen_digest != entry.frozen_digest:
+            return False
+        if entry.type_reusable and configuration is resource:
+            return True
+        type_digest = fingerprint_snapshot(self._resource_configuration_type_payload(configuration))
+        return type_digest == entry.type_digest
+
+    def _resource_digests_hold(self, recorded: tuple[tuple[Any, str], ...]) -> bool:
+        """Re-read each resource a memoized resource fold reached, refusing nothing.
+
+        The resource memo's counterpart of `_resource_identities_hold`. A
+        fresh derivation of the reaching resource raises nothing when a
+        resource it reaches has moved, so this compare answers False and
+        raises nothing either.
+        """
+
+        try:
+            for resource, expected in recorded:
+                if self._kept_resource_identity_digest(resource) == expected:
+                    continue
+                if self._resource_identity_digest(resource) != expected:
+                    return False
+        except Exception:
+            return False
+        return True
+
     def _resource_identity_payload(self, resource: Any) -> Any:
+        return self._resource_identity_fold(resource, None)[0]
+
+    def _resource_identity_fold(
+        self, resource: Any, read: tuple[Any] | None
+    ) -> tuple[Any, Any, Any, bool]:
+        """Fold a resource's identity, with the parts the resource memo keeps.
+
+        Answers the identity payload, the frozen configuration, the
+        configuration type payload, and whether a memo hit may reuse that type
+        payload. `read` carries a configuration the caller already read, so
+        identity() runs once per call site. None reads it here. A resource
+        already being folded on this path answers the recursion marker and no
+        parts.
+        """
+
         resource_id = id(resource)
         stack = self._resource_fingerprint_stack.get()
         if resource_id in stack:
             return (
-                "recursive-resource",
-                type(resource).__module__,
-                type(resource).__qualname__,
+                (
+                    "recursive-resource",
+                    type(resource).__module__,
+                    type(resource).__qualname__,
+                ),
+                None,
+                None,
+                False,
             )
         token = self._resource_fingerprint_stack.set(stack + (resource_id,))
         try:
-            configuration = self._resource_configuration(resource)
+            configuration = self._resource_configuration(resource) if read is None else read[0]
             try:
                 frozen_configuration = freeze(configuration, adapters=self._adapters)
             except UnsupportedValueError as exc:
@@ -8642,6 +9039,10 @@ class Database:
                     f"Resource {type(resource).__module__}:{type(resource).__qualname__} must be snapshot-safe "
                     "or define identity()."
                 ) from exc
+            unobserved: list[str] = []
+            configuration_type = self._resource_configuration_type_payload(
+                configuration, unobserved=unobserved
+            )
             collector = self._fingerprint_resource_collector.get()
             if collector is not None:
                 # The configuration this fold read, recorded so the memo guard
@@ -8652,31 +9053,37 @@ class Database:
                 collector.append(
                     (
                         resource,
-                        fingerprint_snapshot(
-                            (
-                                frozen_configuration,
-                                self._resource_configuration_type_payload(configuration),
-                            )
-                        ),
+                        fingerprint_snapshot((frozen_configuration, configuration_type)),
                     )
                 )
-            return (
+            payload = (
                 "resource-v3",
                 self._runtime_build_payload(),
                 type(resource).__module__,
                 type(resource).__qualname__,
                 self._implementation_type_payload(type(resource)),
                 frozen_configuration,
-                self._resource_configuration_type_payload(configuration),
+                configuration_type,
                 self._resource_method_payload(resource, "probe"),
                 self._resource_method_payload(resource, "load"),
                 self._resource_method_payload(resource, "probe_and_load"),
                 self._resource_method_payload(resource, "identity"),
             )
+            # A resource that is its own configuration is observed field by
+            # field, so a hit can keep the type payload while every read its
+            # encoding made is one the observation covers.
+            return (
+                payload,
+                frozen_configuration,
+                configuration_type,
+                configuration is resource and not unobserved,
+            )
         finally:
             self._resource_fingerprint_stack.reset(token)
 
-    def _resource_configuration_type_payload(self, configuration: Any) -> Any:
+    def _resource_configuration_type_payload(
+        self, configuration: Any, *, unobserved: list[str] | None = None
+    ) -> Any:
         """Pin behavior erased by the ordinary boundary snapshot.
 
         ``freeze`` remains the value contract for resource configuration, but it
@@ -8686,9 +9093,18 @@ class Database:
         ``probe``/``load`` even when its normalized data is unchanged. This
         companion payload mirrors the configuration shape and records every
         behavior-bearing implementation and adapter while leaving K2 unchanged.
+
+        `unobserved` collects the branches whose reads the definition
+        observation does not follow: the contents of a list, mapping or set,
+        which it pins by reference, an adapted value, and a standard-library
+        type, whose namespace this payload walks and the observation does not.
         """
 
         active: dict[int, int] = {}
+
+        def note(branch: str) -> None:
+            if unobserved is not None:
+                unobserved.append(branch)
 
         def guarded(value: Any, build: Callable[[], Any]) -> Any:
             object_id = id(value)
@@ -8749,8 +9165,14 @@ class Database:
             }:
                 return ("frozen-snapshot", type(value).__qualname__)
 
+            value_module = type(value).__module__
+            if value_module != "builtins" and (
+                value_module.partition(".")[0] in sys.stdlib_module_names
+            ):
+                note("stdlib-type")
             adapter_match = adapter_for(value)
             if adapter_match is not None:
+                note("adapted-value")
                 adapted_type, adapter = adapter_match
                 return (
                     "adapted-value",
@@ -8783,6 +9205,7 @@ class Database:
                     ),
                 )
             if isinstance(value, list):
+                note("list")
                 return guarded(
                     value,
                     lambda: (
@@ -8807,6 +9230,7 @@ class Database:
                     ),
                 )
             if isinstance(value, Mapping):
+                note("mapping")
 
                 def mapping_payload() -> Any:
                     items = [
@@ -8836,6 +9260,7 @@ class Database:
 
                 return guarded(value, mapping_payload)
             if isinstance(value, (set, frozenset)):
+                note("set")
 
                 def set_payload() -> Any:
                     items = [(freeze(item, adapters=self._adapters), item) for item in value]
@@ -8890,9 +9315,14 @@ class Database:
 
     def _resource_method_payload(self, resource: Any, method_name: str) -> Any:
         method = getattr(resource, method_name, None)
+        fn = getattr(method, "__func__", method)
+        collector = self._fingerprint_method_collector.get()
+        if collector is not None:
+            # What getattr resolved, which a slot or a descriptor can change
+            # with every object the observation pins left in place.
+            collector.append((resource, method_name, fn))
         if method is None:
             return (method_name, "missing")
-        fn = getattr(method, "__func__", method)
         if isinstance(fn, FunctionType):
             return (method_name, self._function_definition_payload(fn, set()))
         if isinstance(fn, BuiltinFunctionType):

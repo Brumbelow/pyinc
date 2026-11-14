@@ -2755,7 +2755,9 @@ def test_one_fingerprint_reads_each_module_file_once(
     stamped: list[ModuleType] = []
 
     def stamp_with_a_save(self: Database, observed: ModuleType) -> Any:
-        if observed is not module:
+        # A stamp taken inside the query body belongs to the resource read
+        # there, and the raw write that stands for a save is refused there.
+        if observed is not module or self._current_frame() is not None:
             return stamp(self, observed)
         stamped.append(observed)
         if save_first and len(stamped) == stamp_call:

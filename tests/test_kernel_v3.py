@@ -30,6 +30,7 @@ from pyinc import (
     CheckpointVersionError,
     CycleError,
     Database,
+    FileResource,
     FileStatResource,
     FileStatSnapshot,
     FileSystemArtifactStore,
@@ -1626,7 +1627,7 @@ def test_the_module_stamp_folds_exactly_what_the_identity_folds(
         # silently skip the assertion.
         landing_slots = [
             slot
-            for slot in entry
+            for slot in vars(entry).values()
             if isinstance(slot, tuple)
             and slot
             and all(
@@ -6747,3 +6748,665 @@ def test_a_module_attribute_read_after_many_names_is_accepted(
         _assert_warm_matches_fresh(db, "strict", scale, 5)
     finally:
         sys.modules.pop(module_name, None)
+
+
+# A caller's module of resources, imported from its own file so its classes and
+# functions carry the source identity a resource fold anchors them to. Each test
+# imports a copy of its own and changes one thing a resource identity reads.
+_RESOURCE_HELPERS_SOURCE = """\
+def render(path: str, suffix: str = "?") -> str:
+    return "[" + path + "]" + suffix
+
+
+def shout(path: str, suffix: str = "?") -> str:
+    return "[" + path.upper() + "]" + suffix
+"""
+
+_RESOURCE_MODULE_SOURCE = """\
+from dataclasses import dataclass, field
+from pathlib import PurePosixPath
+from typing import Any, NamedTuple
+
+import _HELPERS_MODULE_ as helpers
+
+from pyinc import Database, Resource
+
+SCALE = 1
+
+
+class Point(NamedTuple):
+    x: int
+
+
+def read_text(path: str) -> str:
+    return "text[" + path + "]"
+
+
+def other_text(path: str) -> str:
+    return "other[" + path + "]"
+
+
+def load_one(db: Database, path: str) -> str:
+    return "one"
+
+
+def load_two(db: Database, path: str) -> str:
+    return "two"
+
+
+def load_upper(self: Any, db: Database, path: str) -> str:
+    return path.upper()
+
+
+def load_suffixed(db: Database, path: str, suffix: str = "!") -> str:
+    return path + suffix
+
+
+@dataclass(frozen=True)
+class Reader(Resource[str, str, tuple[str]]):
+    encoding: str = "utf-8"
+
+    def probe(self, path: str) -> tuple[str]:
+        return ("present",)
+
+    def load(self, db: Database, path: str) -> str:
+        return read_text(path) * SCALE + helpers.render(path)
+
+    def label(self, path: str) -> str:
+        return "reader[" + path + "]"
+
+
+@dataclass(frozen=True)
+class Rooted(Resource[str, str, tuple[str]]):
+    root: PurePosixPath = PurePosixPath("data")
+
+    def probe(self, path: str) -> tuple[str]:
+        return ("present",)
+
+    def load(self, db: Database, path: str) -> str:
+        return path
+
+    def label(self, path: str) -> str:
+        return "rooted[" + path + "]"
+
+
+@dataclass
+class Tagged(Resource[str, str, tuple[str]]):
+    tags: list[Any] = field(default_factory=list)
+    encoding: str = "utf-8"
+
+    def probe(self, path: str) -> tuple[str]:
+        return ("present",)
+
+    def load(self, db: Database, path: str) -> str:
+        return path
+
+    def label(self, path: str) -> str:
+        return "tagged[" + path + "]"
+
+
+@dataclass
+class Declared(Resource[str, str, tuple[str]]):
+    options: list[str] = field(default_factory=list)
+
+    def identity(self) -> tuple[str, ...]:
+        return tuple(self.options)
+
+    def probe(self, path: str) -> tuple[str]:
+        return ("present",)
+
+    def load(self, db: Database, path: str) -> str:
+        return path
+
+    def label(self, path: str) -> str:
+        return "declared[" + path + "]"
+
+
+@dataclass
+class Held(Resource[str, str, tuple[str]]):
+    options: list[Any] = field(default_factory=list)
+
+    def identity(self) -> list[Any]:
+        return self.options
+
+    def probe(self, path: str) -> tuple[str]:
+        return ("present",)
+
+    def load(self, db: Database, path: str) -> str:
+        return path
+
+    def label(self, path: str) -> str:
+        return "held[" + path + "]"
+
+
+INNER = Tagged()
+
+
+@dataclass(frozen=True)
+class Outer(Resource[str, str, tuple[str]]):
+    def probe(self, path: str) -> tuple[str]:
+        return ("present",)
+
+    def load(self, db: Database, path: str) -> str:
+        return INNER.read(db, path)
+
+    def label(self, path: str) -> str:
+        return "outer[" + path + "]"
+
+
+class SlotReader:
+    __slots__ = ("load",)
+
+    def __init__(self, load: Any) -> None:
+        self.load = load
+
+    def probe(self, path: str) -> tuple[str]:
+        return ("present",)
+
+    def label(self, path: str) -> str:
+        return "slot[" + path + "]"
+
+    def identity(self) -> str:
+        return "slot-reader"
+
+
+class Picker:
+    def __init__(self, table: dict[str, Any]) -> None:
+        self.table = table
+
+    def __get__(self, instance: Any, owner: Any) -> Any:
+        return self.table["load"]
+
+
+class Picked:
+    load = Picker({"load": load_one})
+
+    def probe(self, path: str) -> tuple[str]:
+        return ("present",)
+
+    def label(self, path: str) -> str:
+        return "picked[" + path + "]"
+
+    def identity(self) -> str:
+        return "picked"
+
+
+@dataclass(frozen=True)
+class Counted(Resource[str, str, tuple[str]]):
+    tally: str = ""
+
+    def identity(self) -> tuple[str, str]:
+        with open(self.tally, "a", encoding="utf-8") as handle:
+            handle.write("i")
+        return ("counted", self.tally)
+
+    def probe(self, path: str) -> tuple[str]:
+        return ("present",)
+
+    def load(self, db: Database, path: str) -> str:
+        return path
+
+    def label(self, path: str) -> str:
+        return "counted[" + path + "]"
+"""
+
+
+def _import_source_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, source: str
+) -> ModuleType:
+    """Import *source* from its own file under *name*, as a caller's code is imported."""
+
+    import importlib.util
+
+    path = tmp_path / f"{name}.py"
+    path.write_text(source, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _resource_modules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> tuple[ModuleType, ModuleType, Path]:
+    """Import a copy of the resource module above and of the helpers it reads."""
+
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    helpers_name = f"{name}_helpers"
+    helpers = _import_source_module(tmp_path, monkeypatch, helpers_name, _RESOURCE_HELPERS_SOURCE)
+    module = _import_source_module(
+        tmp_path,
+        monkeypatch,
+        name,
+        _RESOURCE_MODULE_SOURCE.replace("_HELPERS_MODULE_", helpers_name),
+    )
+    return module, helpers, tmp_path / f"{name}.py"
+
+
+def _resource_identity_after(
+    db: Database, resource: Any, change: Callable[[], object]
+) -> tuple[str, str, str]:
+    """Prime *db*'s resource memo, apply *change*, and read the identity again.
+
+    Answers the identity before the change, then the identity *db* gives after
+    it, then the identity a fresh database gives after it. A memo that serves a
+    stale identity makes the second differ from the third.
+    """
+
+    before = db._resource_key(resource, "key").identity
+    assert db._resource_key(resource, "key").identity == before
+    # Only a memoized resource can be probed, so the entry must be there.
+    assert db._resource_identity_memo[id(resource)].resource is resource
+    change()
+    warm = db._resource_key(resource, "key").identity
+    return before, warm, Database()._resource_key(resource, "key").identity
+
+
+def test_a_warm_resource_read_folds_no_type_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second read of one resource object answers its identity from the memo.
+
+    The fold walks the resource class, its methods and their modules. Deriving
+    it again on every read made a tracked file read cost tens of milliseconds.
+    """
+
+    target = tmp_path / "notes.txt"
+    target.write_text("body", encoding="utf-8")
+    resource = FileResource()
+    db = Database()
+    assert db.read_resource(resource, str(target)) == "body"
+
+    walked: list[type[Any]] = []
+    walk = Database._implementation_type_payload
+
+    def counting(self: Database, value: type[Any]) -> Any:
+        walked.append(value)
+        return walk(self, value)
+
+    monkeypatch.setattr(Database, "_implementation_type_payload", counting)
+    assert db.read_resource(resource, str(target)) == "body"
+    assert walked == []
+
+
+def test_a_warm_get_reads_its_captured_resource_digest_from_the_memo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The query memo's resource arm reuses the resource memo's digest.
+
+    The arm re-reads a captured resource's configuration digest on every warm
+    get. For a resource that is its own configuration, the type half of that
+    digest walks the resource class again unless the resource memo answers it.
+    """
+
+    files = FileResource()
+    target = tmp_path / "notes.txt"
+    target.write_text("body", encoding="utf-8")
+
+    @query(key="memo-captured-file-resource")
+    def read_notes(db: Database, path: str) -> str:
+        return files.read(db, path)
+
+    db = Database()
+    assert db.get(read_notes, str(target)) == "body"
+    assert db.get(read_notes, str(target)) == "body"
+
+    encoded: list[Any] = []
+    encode = Database._resource_configuration_type_payload
+
+    def counting(self: Database, configuration: Any, *args: Any, **kwargs: Any) -> Any:
+        encoded.append(configuration)
+        return encode(self, configuration, *args, **kwargs)
+
+    monkeypatch.setattr(Database, "_resource_configuration_type_payload", counting)
+    assert db.get(read_notes, str(target)) == "body"
+    assert not any(configuration is files for configuration in encoded)
+
+
+def test_resource_memo_sees_a_rebound_method_global(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A function a method calls by its global name is read through the method."""
+
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_method_global")
+    before, warm, fresh = _resource_identity_after(
+        Database(),
+        module.Reader(),
+        lambda: monkeypatch.setattr(module, "read_text", module.other_text),
+    )
+    assert warm == fresh != before
+
+
+def test_resource_memo_sees_a_replaced_class_method(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_class_method")
+    before, warm, fresh = _resource_identity_after(
+        Database(),
+        module.Reader(),
+        lambda: monkeypatch.setattr(module.Reader, "load", module.load_upper),
+    )
+    assert warm == fresh != before
+
+
+def test_resource_memo_sees_a_rebound_configuration_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_rebound_field")
+    resource = module.Tagged()
+    before, warm, fresh = _resource_identity_after(
+        Database(), resource, lambda: setattr(resource, "encoding", "latin-1")
+    )
+    assert warm == fresh != before
+
+
+@pytest.mark.parametrize("change", ["append", "replace-value", "replace-type"])
+def test_resource_memo_sees_configuration_mutated_in_place(
+    change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A list the resource holds can change while the resource holds the same list.
+
+    An appended item moves both halves of the configuration digest. A value
+    replaced by one of the same type moves only the frozen half. A NamedTuple
+    put in place of an equal plain tuple freezes the same and moves only the
+    configuration type, so the type half must be derived again for a resource
+    holding a list.
+    """
+
+    module, _helpers, _path = _resource_modules(
+        tmp_path, monkeypatch, f"pyinc_memo_in_place_{change.replace('-', '_')}"
+    )
+    resource = module.Tagged(tags=[(1,)])
+    if change == "append":
+
+        def mutate() -> None:
+            resource.tags.append((2,))
+
+    elif change == "replace-value":
+
+        def mutate() -> None:
+            resource.tags[0] = (2,)
+
+    else:
+        # The two values the replacement relies on freeze alike.
+        assert fingerprint_snapshot(freeze([(1,)])) == fingerprint_snapshot(
+            freeze([module.Point(1)])
+        )
+
+        def mutate() -> None:
+            resource.tags[0] = module.Point(1)
+
+    before, warm, fresh = _resource_identity_after(Database(), resource, mutate)
+    assert warm == fresh != before
+
+
+def test_resource_memo_sees_a_standard_library_type_its_configuration_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The configuration type payload walks a standard-library class the observation pins.
+
+    A path field is encoded with its class's namespace, which a write to that
+    class moves. The observation pins standard-library classes by reference, so
+    a resource holding one derives the type half of its digest on every hit.
+    """
+
+    import pathlib
+
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_stdlib_field")
+    before, warm, fresh = _resource_identity_after(
+        Database(),
+        module.Rooted(),
+        lambda: monkeypatch.setattr(pathlib.PurePosixPath, "pyinc_marker", 1, raising=False),
+    )
+    assert warm == fresh != before
+
+
+def test_resource_memo_sees_identity_returning_a_new_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """identity() hands back a new value of the same shape, read from state that moved in place."""
+
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_new_identity")
+    resource = module.Declared(options=["a"])
+    before, warm, fresh = _resource_identity_after(
+        Database(), resource, lambda: resource.options.__setitem__(0, "b")
+    )
+    assert warm == fresh != before
+
+
+def test_resource_memo_sees_a_module_constant_a_method_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_constant")
+    before, warm, fresh = _resource_identity_after(
+        Database(), module.Reader(), lambda: monkeypatch.setattr(module, "SCALE", 2)
+    )
+    assert warm == fresh != before
+
+
+def test_resource_memo_sees_a_nested_resource_reconfigured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resource a method reads folds into the identity of the resource reading it."""
+
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_nested")
+    before, warm, fresh = _resource_identity_after(
+        Database(), module.Outer(), lambda: module.INNER.tags.append("moved")
+    )
+    assert warm == fresh != before
+
+
+def test_resource_memo_sees_a_rebound_load_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slot holds no instance dictionary entry, so only the resolved method shows the change."""
+
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_slot")
+    resource = module.SlotReader(module.load_one)
+    before, warm, fresh = _resource_identity_after(
+        Database(), resource, lambda: setattr(resource, "load", module.load_two)
+    )
+    assert warm == fresh != before
+
+
+def test_resource_memo_sees_a_load_slot_function_defaults_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The slot still resolves to the same function, so only observing that function shows the change."""
+
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_slot_defaults")
+    resource = module.SlotReader(module.load_suffixed)
+    before, warm, fresh = _resource_identity_after(
+        Database(),
+        resource,
+        lambda: monkeypatch.setattr(module.load_suffixed, "__defaults__", ("?",)),
+    )
+    assert warm == fresh != before
+
+
+def test_resource_memo_sees_a_descriptor_table_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A class attribute descriptor can hand back a different method with nothing rebound."""
+
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_descriptor")
+    table = vars(module.Picked)["load"].table
+    before, warm, fresh = _resource_identity_after(
+        Database(), module.Picked(), lambda: table.__setitem__("load", module.load_two)
+    )
+    assert warm == fresh != before
+
+
+def test_resource_memo_refuses_with_fresh_once_its_class_leaves_the_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The resource type is reached by no name, so its module binding is checked directly.
+
+    A fresh fold refuses a class its module no longer binds. A memo that kept
+    answering would serve an identity no fresh database can derive.
+    """
+
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_unbound_class")
+    resource = module.Reader()
+    db = Database()
+    db._resource_key(resource, "key")
+    assert db._resource_identity_memo[id(resource)].resource is resource
+    monkeypatch.delattr(module, "Reader")
+    with pytest.raises(UnsupportedValueError, match="not the live module binding"):
+        Database()._resource_key(resource, "key")
+    with pytest.raises(UnsupportedValueError, match="not the live module binding"):
+        db._resource_key(resource, "key")
+
+
+def test_resource_memo_raises_as_fresh_once_its_identity_cannot_freeze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An error inside a guard arm is a miss, so the fold raises its own error.
+
+    identity() hands back a list the resource holds. Once an object no adapter
+    covers sits in that list, the guard's freeze of the configuration fails. A
+    warm read must then raise what a fresh read raises.
+    """
+
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_unfreezable")
+    resource = module.Held(options=["a"])
+    db = Database()
+    db._resource_key(resource, "key")
+    assert db._resource_identity_memo[id(resource)].resource is resource
+    resource.options.append(object())
+    with pytest.raises(UnsupportedValueError, match="must be snapshot-safe or define") as fresh:
+        Database()._resource_key(resource, "key")
+    with pytest.raises(UnsupportedValueError) as warm:
+        db._resource_key(resource, "key")
+    assert str(warm.value) == str(fresh.value)
+
+
+def test_resource_memo_sees_a_rebound_chain_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_chain_target")
+    before, warm, fresh = _resource_identity_after(
+        Database(), module.Reader(), lambda: monkeypatch.setattr(helpers, "render", helpers.shout)
+    )
+    assert warm == fresh != before
+
+
+def test_resource_memo_sees_chain_target_defaults_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_chain_defaults")
+    before, warm, fresh = _resource_identity_after(
+        Database(),
+        module.Reader(),
+        lambda: monkeypatch.setattr(helpers.render, "__defaults__", ("!",)),
+    )
+    assert warm == fresh != before
+
+
+def test_resource_memo_sees_its_module_file_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A save moves the module's bytes with no reload and no binding moved."""
+
+    module, _helpers, path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_saved_file")
+    source = path.read_text(encoding="utf-8")
+    before, warm, fresh = _resource_identity_after(
+        Database(),
+        module.Reader(),
+        lambda: path.write_text(f"{source}# A comment someone saved.\n", encoding="utf-8"),
+    )
+    assert warm == fresh != before
+
+
+def test_a_resource_memo_hit_calls_identity_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """identity() runs user code, so each read calls it once, as a fresh read does."""
+
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_identity_calls")
+    tally = tmp_path / "identity-reads"
+    tally.write_text("", encoding="utf-8")
+    resource = module.Counted(tally=str(tally))
+    db = Database()
+    first = db._resource_key(resource, "key").identity
+    assert tally.read_text(encoding="utf-8") == "i"
+    assert db._resource_key(resource, "key").identity == first
+    assert db._resource_identity_memo[id(resource)].resource is resource
+    assert tally.read_text(encoding="utf-8") == "ii"
+    db._resource_identity_digest(resource)
+    assert tally.read_text(encoding="utf-8") == "iii"
+
+
+def test_a_new_resource_object_per_read_misses_and_stays_correct(tmp_path: Path) -> None:
+    """The memo is keyed by the resource object, so equal objects get entries of their own."""
+
+    target = tmp_path / "notes.txt"
+    target.write_text("body", encoding="utf-8")
+    db = Database()
+    identities = []
+    for encoding in ("utf-8", "latin-1", "utf-8"):
+        resource = FileResource(encoding=encoding)
+        assert db.read_resource(resource, str(target)) == "body"
+        identity = db._resource_key(resource, str(target)).identity
+        assert db._resource_identity_memo[id(resource)].resource is resource
+        assert identity == Database()._resource_key(resource, str(target)).identity
+        identities.append(identity)
+    assert identities[0] == identities[2] != identities[1]
+    assert len(db._resource_identity_memo) == 3
+
+
+def test_the_resource_identity_memo_evicts_its_oldest_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Code that builds a new resource object per read cannot grow the memo past its cap."""
+
+    assert runtime_module._RESOURCE_IDENTITY_MEMO_LIMIT == 256
+    monkeypatch.setattr(runtime_module, "_RESOURCE_IDENTITY_MEMO_LIMIT", 2)
+    first, second, third = (FileResource(encoding=name) for name in ("utf-8", "latin-1", "ascii"))
+    db = Database()
+    for resource in (first, second, third):
+        db._resource_key(resource, "key")
+    assert list(db._resource_identity_memo) == [id(second), id(third)]
+    # A hit leaves the order alone. A refill enters at the back.
+    db._resource_key(second, "key")
+    db._resource_key(first, "key")
+    assert list(db._resource_identity_memo) == [id(third), id(first)]
+
+
+def test_an_unhashable_dataclass_resource_is_memoized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The memo keys on the object's id, so a resource needs no hash to be memoized."""
+
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_unhashable")
+    resource = module.Tagged(tags=["a"])
+    with pytest.raises(TypeError):
+        hash(resource)
+    db = Database()
+    identity = db._resource_key(resource, "key").identity
+    assert db._resource_identity_memo[id(resource)].resource is resource
+    assert db._resource_key(resource, "key").identity == identity
+    assert identity == Database()._resource_key(resource, "key").identity
+
+
+def test_a_pinned_capture_walk_sees_a_rebound_load_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checkpoint warming names a captured resource by the identity the memo answers."""
+
+    module, _helpers, _path = _resource_modules(tmp_path, monkeypatch, "pyinc_memo_pinned_slot")
+    reader = module.SlotReader(module.load_one)
+
+    @query(key="memo-pinned-slot-reader")
+    def read_slot(db: Database, path: str) -> str:
+        return cast(str, reader.label(path))
+
+    db = Database()
+    _queries, before = db._collect_pinned_capture_objects(read_slot.fn)
+    assert db._resource_identity_memo[id(reader)].resource is reader
+    reader.load = module.load_two
+    _queries, warm = db._collect_pinned_capture_objects(read_slot.fn)
+    _queries, fresh = Database()._collect_pinned_capture_objects(read_slot.fn)
+    assert set(warm) == set(fresh) != set(before)
