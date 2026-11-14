@@ -507,3 +507,283 @@ def _is_refusable_import(node: ast.Import | ast.ImportFrom) -> bool:
         )
     module = node.module or ""
     return node.level > 0 or module.partition(".")[0] not in sys.stdlib_module_names
+
+
+_HELPERS_SOURCE = '''
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Helper:
+    def describe(self) -> int:
+        import pyinc_body_import_limits
+
+        return pyinc_body_import_limits.LIMIT
+
+
+HELPER = Helper()
+'''
+
+_CLASS_ATTRIBUTES_SOURCE = '''
+from dataclasses import dataclass
+
+from pyinc import Database, query
+from pyinc_body_import_pkg import helpers
+from pyinc_body_import_pkg.helpers import Helper
+
+HELPER = Helper()
+
+
+@dataclass(frozen=True)
+class Strategy:
+    factor: int = 1
+
+    def describe(self) -> int:
+        import pyinc_body_import_limits
+
+        return pyinc_body_import_limits.LIMIT
+
+    def run(self) -> int:
+        return self.factor
+
+
+class Registry:
+    default = Strategy()
+
+
+@query
+def instance_attribute(db: Database) -> int:
+    return Registry.default.run()
+
+
+class HandlerA:
+    def describe(self) -> int:
+        import pyinc_body_import_limits
+
+        return pyinc_body_import_limits.LIMIT
+
+    def run(self) -> int:
+        return 1
+
+
+class Plugins:
+    handlers = (HandlerA,)
+
+
+@query
+def tuple_of_classes(db: Database) -> int:
+    return sum(handler().run() for handler in Plugins.handlers)
+
+
+class Threshold(int):
+    def describe(self) -> int:
+        import pyinc_body_import_limits
+
+        return pyinc_body_import_limits.LIMIT
+
+
+class Settings:
+    threshold = Threshold(1)
+
+
+@query
+def scalar_subclass_attribute(db: Database) -> int:
+    return int(Settings.threshold)
+
+
+@dataclass(frozen=True)
+class GlobalReader:
+    factor: int = 1
+
+    def helper(self) -> Helper:
+        return HELPER
+
+    def run(self) -> int:
+        return self.factor
+
+
+class GlobalReaders:
+    default = GlobalReader()
+
+
+@query
+def method_global(db: Database) -> int:
+    return GlobalReaders.default.run()
+
+
+@dataclass(frozen=True)
+class ModuleReader:
+    factor: int = 1
+
+    def helper(self) -> Helper:
+        return helpers.HELPER
+
+    def run(self) -> int:
+        return self.factor
+
+
+class ModuleReaders:
+    default = ModuleReader()
+
+
+@query
+def method_module_attribute(db: Database) -> int:
+    return ModuleReaders.default.run()
+
+
+class Labels(tuple):
+    def describe(self) -> int:
+        import pyinc_body_import_limits
+
+        return pyinc_body_import_limits.LIMIT
+
+
+LABELS = Labels(("a", "b"))
+
+
+@query(cutoff=LABELS.count)
+def label(db: Database) -> str:
+    return "a"
+
+
+@dataclass(frozen=True)
+class PolicyReader:
+    factor: int = 1
+
+    def label(self, db: Database) -> str:
+        return label(db)
+
+    def run(self) -> int:
+        return self.factor
+
+
+class PolicyReaders:
+    default = PolicyReader()
+
+
+@query
+def method_policy_owner(db: Database) -> int:
+    return PolicyReaders.default.run()
+'''
+
+
+def _cause_chain(error: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    while current is not None:
+        chain.append(current)
+        current = current.__cause__
+    return chain
+
+
+@pytest.mark.parametrize(
+    ("name", "importing_function"),
+    [
+        ("instance_attribute", "class_attributes.Strategy.describe"),
+        ("tuple_of_classes", "class_attributes.HandlerA.describe"),
+        ("scalar_subclass_attribute", "class_attributes.Threshold.describe"),
+        ("method_global", "helpers.Helper.describe"),
+        ("method_module_attribute", "helpers.Helper.describe"),
+        ("method_policy_owner", "class_attributes.Labels.describe"),
+    ],
+)
+def test_a_class_attribute_whose_fold_meets_an_import_statement_is_refused(
+    name: str, importing_function: str, fixture_package: ModuleType, tmp_path: Path
+) -> None:
+    """A class attribute whose value reaches an importing method is refused.
+
+    The query reads an attribute of a class it captures: a frozen dataclass
+    instance, a tuple of classes, or an int subclass instance. A method of the
+    class that value reaches imports a user module and is never called. In the
+    last three cases that method sits behind a method of the attribute's own
+    class: a global it reads, a module attribute it reads, or the owner of a
+    query policy it reaches. Those folds wrap the refusal in another error.
+    The class fold leaves out an attribute it cannot freeze when no method of
+    the class reads it. It left these out too, so the attribute was outside
+    identity. After the attribute was rebound, a warm database kept the old
+    answer. The refusal now reaches the caller, itself or in the cause chain.
+    The preview reports the error with the database's message.
+    """
+
+    package = tmp_path / "pyinc_body_import_pkg"
+    (package / "helpers.py").write_text(_HELPERS_SOURCE, encoding="utf-8")
+    (package / "class_attributes.py").write_text(_CLASS_ATTRIBUTES_SOURCE, encoding="utf-8")
+    captured = getattr(importlib.import_module("pyinc_body_import_pkg.class_attributes"), name)
+    expected = (
+        f"pyinc_body_import_pkg.{importing_function} runs "
+        f"{'import pyinc_body_import_limits'!r}"
+    )
+
+    with pytest.raises(UnsupportedValueError) as refusal:
+        Database().get(captured)
+
+    refusals = [str(error) for error in _cause_chain(refusal.value) if expected in str(error)]
+    assert len(refusals) == 1
+    assert "Move the import to module scope" in refusals[0]
+    assert _IMPORT_TARGETS.isdisjoint(sys.modules)
+    rejected = [info for info in explain_query_captures(captured) if not info.accepted]
+    assert [info.rejection_reason for info in rejected] == [str(refusal.value)]
+
+
+_ADAPTERS_SOURCE = '''
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class Scale:
+    factor: int = 1
+
+    def describe(self) -> int:
+        import pyinc_body_import_limits
+
+        return pyinc_body_import_limits.LIMIT
+
+
+class Money:
+    def __init__(self, cents: int) -> None:
+        self.cents = cents
+
+
+class MoneyAdapter:
+    def __init__(self) -> None:
+        self.scale = Scale()
+
+    def freeze(self, value: Money, freeze: Any) -> int:
+        return value.cents
+
+    def thaw(self, snapshot: int, thaw: Any) -> Money:
+        return Money(snapshot)
+'''
+
+
+def test_an_adapter_whose_configuration_meets_an_import_statement_is_refused(
+    fixture_package: ModuleType, tmp_path: Path
+) -> None:
+    """An adapter whose configuration reaches an importing method is refused.
+
+    A database digests each registered adapter's configuration when it is
+    created and checks it again at every top-level request. An adapter whose
+    configuration cannot be digested is left out of that check. This one holds
+    a frozen dataclass whose method imports a user module, so its digest meets
+    the refusal. It was left out too, and replacing its configuration went
+    unnoticed. Creating the database now raises with the refusal in the cause
+    chain.
+    """
+
+    (tmp_path / "pyinc_body_import_pkg" / "adapters.py").write_text(
+        _ADAPTERS_SOURCE, encoding="utf-8"
+    )
+    adapters = importlib.import_module("pyinc_body_import_pkg.adapters")
+    expected = (
+        "pyinc_body_import_pkg.adapters.Scale.describe runs "
+        f"{'import pyinc_body_import_limits'!r}"
+    )
+
+    with pytest.raises(UnsupportedValueError, match="MoneyAdapter") as refusal:
+        Database(adapters={adapters.Money: adapters.MoneyAdapter()})
+
+    refusals = [str(error) for error in _cause_chain(refusal.value) if expected in str(error)]
+    assert len(refusals) == 1
+    assert "Move the import to module scope" in refusals[0]
+    assert _IMPORT_TARGETS.isdisjoint(sys.modules)

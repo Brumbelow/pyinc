@@ -684,7 +684,9 @@ any other caught failure.
     configuration participate in checkpoint identity, and stay out of a
     query's definition fingerprint. An adapter whose configuration cannot be
     digested contributes no digest, is skipped by the in-process check, and is
-    refused trust by checkpoints.
+    refused trust by checkpoints. Where the digest meets a refused import
+    statement, `Database` construction raises `UnsupportedValueError` instead,
+    with the refusal in its `__cause__` chain.
 
   The built-in adapters (`BUILTIN_ADAPTERS`: a stateless `FileStatAdapter` for
   `FileStatSnapshot`) hold no instance configuration and ship with the kernel.

@@ -663,6 +663,34 @@ def _scan_reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
 _IMPORT_NAME_OPCODE = dis.opmap["IMPORT_NAME"]
 
 
+class _RefusedImportError(UnsupportedValueError):
+    """The refusal of an import statement in folded code.
+
+    A caller catches it as an UnsupportedValueError. Two folds leave out a
+    value they cannot freeze: a class's attributes and an adapter's
+    configuration. Each raises instead when this refusal is the error or is in
+    its __cause__ chain. Such a value froze before import statements were
+    refused, so leaving it out would take it out of identity.
+    """
+
+
+def _caused_by_refused_import(error: BaseException) -> bool:
+    """True when *error* is an import refusal or has one in its __cause__ chain.
+
+    A fold that wraps an error raises the wrapper from it, so a refusal met
+    deep in a fold can reach a handler as the cause of another error.
+    """
+
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        if isinstance(current, _RefusedImportError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__
+    return False
+
+
 def _refused_import_statements(code: CodeType) -> tuple[str, ...]:
     """The import statements in *code*, and in code nested in it, that a fold refuses.
 
@@ -2105,7 +2133,8 @@ class Database:
         # violates the value-boundary law. Every top-level request re-derives
         # the digest of each adapter named here and raises AdapterContractError
         # when one moved. An adapter whose configuration cannot be digested
-        # contributes no entry. Drift there is undetectable in-process, so
+        # contributes no entry, unless the digest met an import refusal, which
+        # raises here. Drift there is undetectable in-process, so
         # enforcement falls back to the documented law (the checkpoint boundary
         # still refuses trust there). Every other adapter in the same registry
         # stays checked.
@@ -6262,7 +6291,7 @@ class Database:
         statements = _refused_import_statements(fn.__code__)
         if not statements or Database._is_runtime_pinned_function(fn):
             return
-        raise UnsupportedValueError(
+        raise _RefusedImportError(
             f"Function {fn.__module__}.{fn.__qualname__} runs "
             f"{', '.join(repr(statement) for statement in statements)} in code "
             "that is folded into query or resource identity. A module imported "
@@ -6801,12 +6830,14 @@ class Database:
             return self._type_definition_payload(owner)
         try:
             frozen = self._freeze_static_capture(owner, set())
-        except UnsupportedValueError:
+        except UnsupportedValueError as exc:
             if not allow_instance_state:
+                # Chained, so an import refusal met inside the owner stays in
+                # the cause chain a class fold reads.
                 raise UnsupportedValueError(
                     f"Bound policy owner {type(owner).__module__}."
                     f"{type(owner).__qualname__} is not snapshot-safe."
-                ) from None
+                ) from exc
             frozen = self._policy_instance_state_payload(owner)
         return (
             "instance",
@@ -6876,8 +6907,9 @@ class Database:
 
         Built one entry at a time, so an adapter whose configuration cannot be
         digested (slot state, a state key that defeats the digest's sort)
-        costs the check only its own entry. Construction succeeds either way.
-        Such an adapter loses only the in-process check on itself.
+        costs the check only its own entry, and construction still succeeds.
+        Such an adapter loses only the in-process check on itself. A digest
+        that meets an import refusal raises instead, so construction fails.
 
         The kernel's own fixed adapters contribute nothing here. They hold no
         instance state, so the check has no configuration to watch. Naming
@@ -6889,7 +6921,12 @@ class Database:
         for value_type, adapter in self._non_static_adapters.items():
             try:
                 digest = self._adapter_configuration_digest(adapter)
-            except (UnsupportedValueError, TypeError, ValueError):
+            except (UnsupportedValueError, TypeError, ValueError) as exc:
+                if _caused_by_refused_import(exc):
+                    # The configuration reaches an importing method. It was
+                    # digested before such imports were refused, so skipping
+                    # it would lose the check on this adapter.
+                    raise
                 continue
             digests[_adapter_key(value_type)] = digest
         return digests
@@ -7849,8 +7886,13 @@ class Database:
                             "value",
                             self._freeze_static_capture(attribute, set()),
                         )
-                    except UnsupportedValueError:
+                    except UnsupportedValueError as exc:
                         if is_local or name in referenced_names:
+                            raise
+                        if _caused_by_refused_import(exc):
+                            # The value reaches an importing method. It folded
+                            # before such imports were refused, so leaving it
+                            # out would take it out of identity.
                             raise
                         continue
                 attributes.append((name, payload))
