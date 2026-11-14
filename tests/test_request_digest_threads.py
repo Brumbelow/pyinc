@@ -9,6 +9,7 @@ changes a resource's identity, and checks each answer against a fresh database.
 
 from __future__ import annotations
 
+import contextvars
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -99,3 +100,69 @@ def test_a_span_keeps_its_resource_digests_from_other_threads() -> None:
     # The warm subscription sees the cold execution a fresh one sees.
     assert changed == (("cell@2", ["executed"]),) * 2
     assert Database().get(declared_cell) == "cell@3"
+
+
+def _settled_database(cell: Any) -> Database:
+    # On 3.14 the first fold of a resource class can add annotation cache
+    # entries to a base class dictionary, so the first memo entry misses once.
+    # A second read leaves an entry the span's guard then matches.
+    db = Database()
+    db.get(cell)
+    db.get(cell)
+    return db
+
+
+def test_observe_in_a_span_catches_up_to_a_change_declared_on_another_thread() -> None:
+    resource = _VersionedResource()
+
+    @query
+    def cell(db: Database) -> str:
+        return resource.read(db, "cell")
+
+    db = _settled_database(cell)
+    span_read = threading.Event()
+    declared = threading.Event()
+
+    def hold_span() -> tuple[str, list[str]]:
+        events: list[QueryChangeEvent] = []
+        with db.request_span():
+            db.get(cell)
+            span_read.set()
+            assert declared.wait(_WAIT)
+            # The span still holds the digest it read before the change.
+            db.observe(events.append, cell)
+            after = db.get(cell)
+        return after, [event.decision for event in events]
+
+    def declare_change() -> None:
+        try:
+            assert span_read.wait(_WAIT)
+            resource.version[0] = 2
+            db.request_inputs_changed()
+        finally:
+            declared.set()
+
+    held, _ = run_in_threads(hold_span, declare_change)
+    assert held == ("cell@2", ["executed"])
+    assert held == _fresh_observed(cell)
+
+
+def test_observe_in_a_span_catches_up_to_a_change_declared_from_another_context() -> None:
+    resource = _VersionedResource()
+
+    @query
+    def cell(db: Database) -> str:
+        return resource.read(db, "cell")
+
+    db = _settled_database(cell)
+    events: list[QueryChangeEvent] = []
+    with db.request_span():
+        db.get(cell)
+        resource.version[0] = 2
+        # This context never saw the span open, so it holds no request.
+        contextvars.Context().run(db.request_inputs_changed)
+        db.observe(events.append, cell)
+        after = db.get(cell)
+    held = (after, [event.decision for event in events])
+    assert held == ("cell@2", ["executed"])
+    assert held == _fresh_observed(cell)

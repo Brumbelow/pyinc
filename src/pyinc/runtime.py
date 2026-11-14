@@ -2745,6 +2745,11 @@ class Database:
         if not callable(callback):
             raise TypeError("db.observe() expects a callable as its first argument.")
         with self._state_lock:
+            # Called inside a span, this computes the key from the span's kept
+            # resource digests. A change declared from another thread or
+            # context cleared only that caller's, so the span catches up here
+            # as a call joining it does.
+            self._sync_span_to_epoch()
             key, _ = self._query_key(query, args, kwargs)
             self._observer_token_counter += 1
             token = self._observer_token_counter
@@ -10041,8 +10046,9 @@ class Database:
         """The resource digests this thread's open request has kept, if any.
 
         They live on the request, so a span on one thread never answers for a
-        call on another. A call outside a request, such as `observe`, has none
-        and reads every resource afresh.
+        call on another. A call outside a request has none and reads every
+        resource afresh. `observe` inside a span reads the span's, after it
+        catches up to any declared change.
         """
         request = self._live_request()
         return None if request is None else request.resource_digests
