@@ -157,11 +157,11 @@ def _discovered_identity_keys() -> frozenset[str]:
     return frozenset(key for key, _obj in _shipped_identities(Database(mode="strict")))
 
 
-#: Every identity-bearing object the distribution ships, by key: 91 query
+#: Every identity-bearing object the distribution ships, by key: 92 query
 #: objects and 30 resource handles. Pinned as a literal, so a new one joins the
 #: surface only through an edit here.
 _SHIPPED_IDENTITY_INVENTORY: frozenset[str] = frozenset((
-    # ---- 91 Query objects -------------------------------------------
+    # ---- 92 Query objects -------------------------------------------
     "Q|pyinc.integrations.csv_data:csv_analysis_payload",
     "Q|pyinc.integrations.csv_data:csv_columns_payload",
     "Q|pyinc.integrations.csv_data:csv_diagnostics_payload",
@@ -243,6 +243,7 @@ _SHIPPED_IDENTITY_INVENTORY: frozenset[str] = frozenset((
     "Q|pyinc.integrations.xml_config:xml_elements_payload",
     "Q|pyinc.integrations.xml_config:xml_file_text",
     "Q|pyinc_codegen.schema:alias_cycle_diagnostics",
+    "Q|pyinc_codegen.schema:definition_declared",
     "Q|pyinc_codegen.schema:definition_model",
     "Q|pyinc_codegen.schema:definition_names",
     "Q|pyinc_codegen.schema:definition_pointer",
@@ -291,7 +292,7 @@ def test_the_shipped_identity_inventory_is_exact() -> None:
     """The population the cell below guards, pinned by name.
 
     The inventory is a frozenset literal, as in
-    ``tests/test_cutoff_inventory.py``: 121 objects, 91 query objects and 30
+    ``tests/test_cutoff_inventory.py``: 122 objects, 92 query objects and 30
     resource handles. Adding a shipped query or resource handle therefore takes
     an edit here, which makes every widening of what the stability cell must
     hold for explicit. The literal is the same for every Python version, and

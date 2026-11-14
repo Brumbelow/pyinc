@@ -2300,3 +2300,117 @@ def test_nullable_alias_edges_still_form_a_cycle(tmp_path: Path) -> None:
     }
     analysis = _analyze(tmp_path, schema)
     assert sum(d.code == "alias-cycle" for d in analysis.diagnostics) == 2
+
+
+def test_a_property_named_like_a_model_its_definition_references_is_reserved(
+    tmp_path: Path,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Tag": {"type": "object", "properties": {"label": {"type": "string"}}},
+                "Post": {
+                    "type": "object",
+                    "properties": {"Tag": {"type": "string"}, "tag": {"$ref": "#/$defs/Tag"}},
+                },
+                "Node": {
+                    "type": "object",
+                    "properties": {"Node": {"type": "string"}, "next": {"$ref": "#/$defs/Node"}},
+                },
+                "leaf": {
+                    "type": "object",
+                    "properties": {"child": {"$ref": "#/$defs/leaf"}, "leaf": {"type": "string"}},
+                },
+            }
+        },
+    )
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    # The field binds the class name in the class body. ``tag: Tag | None``
+    # below it then names the field, and the module fails a type check. In
+    # leaf the field follows the reference and is refused all the same.
+    assert [(d.code, d.json_pointer) for d in analysis.errors] == [
+        ("reserved-field-name", "/$defs/Node/properties/Node"),
+        ("reserved-field-name", "/$defs/Post/properties/Tag"),
+        ("reserved-field-name", "/$defs/leaf/properties/leaf"),
+    ]
+    with pytest.raises(SchemaGenerationError):
+        generate(db, schema_path, out)
+    assert _tree(out) == {}
+
+
+def test_a_definition_named_annotations_is_reserved(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "annotations": {"type": "object", "properties": {"key": {"type": "string"}}},
+                "Holder": {
+                    "type": "object",
+                    "properties": {"value": {"$ref": "#/$defs/annotations"}},
+                },
+                "Meta": {
+                    "type": "object",
+                    "properties": {
+                        "annotations": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        },
+    )
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    # Every generated module opens with ``from __future__ import annotations``.
+    # A field may still take the name, because no annotation spells it.
+    assert [(d.code, d.json_pointer) for d in analysis.errors] == [
+        ("reserved-definition-name", "/$defs/annotations"),
+    ]
+    with pytest.raises(SchemaGenerationError):
+        generate(db, schema_path, out)
+    assert _tree(out) == {}
+
+
+def test_a_ref_resolves_only_to_a_definition_in_the_section_it_names(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    referrer = {"type": "object", "properties": {"a": {"$ref": "#/$defs/A"}}}
+    db = Database(mode="strict")
+
+    _write_schema(schema_path, {"definitions": {"A": {"type": "string"}}, "$defs": {"B": referrer}})
+    analysis = schema_analysis(db, schema_path)
+    assert [(d.code, d.json_pointer) for d in analysis.errors] == [
+        ("unknown-ref", "/$defs/B/properties/a/$ref"),
+    ]
+
+    # Moving A into the section the reference names resolves it on the same
+    # database, as it does on a fresh one.
+    _write_schema(schema_path, {"$defs": {"A": {"type": "string"}, "B": referrer}})
+    analysis = schema_analysis(db, schema_path)
+    assert analysis == schema_analysis(Database(mode="strict"), schema_path)
+    assert analysis.errors == ()
+    referring = next(model for model in analysis.models if model.name == "B")
+    assert [(field.name, field.type_expr) for field in referring.fields] == [("a", "A")]
+
+    # A name declared in both sections is a duplicate, and a reference into
+    # either section still finds it.
+    both = {
+        "type": "object",
+        "properties": {"a": {"$ref": "#/$defs/A"}, "b": {"$ref": "#/definitions/A"}},
+    }
+    _write_schema(
+        schema_path,
+        {"$defs": {"A": {"type": "string"}, "B": both}, "definitions": {"A": {"type": "string"}}},
+    )
+    analysis = schema_analysis(db, schema_path)
+    assert analysis == schema_analysis(Database(mode="strict"), schema_path)
+    assert [(d.code, d.json_pointer) for d in analysis.errors] == [
+        ("duplicate-definition", "/$defs/A"),
+        ("duplicate-definition", "/definitions/A"),
+    ]

@@ -140,6 +140,12 @@ def _work(
 # generator expression. They used to count as unpinned, so the aggregate
 # re-executed on every restore and reused its six branches. It is pinned now
 # and restores as one reuse with no execution.
+#
+# The codegen edit rows were measured again when a $ref came to resolve only
+# in the section it names. A model now reads the pointer of each definition it
+# references, where it used to read that definition's content. Editing Color
+# no longer re-runs the models of Widget and Gizmo. Removing Size re-runs the
+# pointer read that Widget's model held for it.
 PYINC_WORK_EXPECTATIONS: dict[tuple[str, str], WorkExpectation] = {
     ("synthetic", "cold"): _work(7, 0, 0, 0, 14, 7, 18, 18),
     ("synthetic", "unchanged"): _work(0, 7, 0, 0, 14, 0, 18, 0),
@@ -158,9 +164,9 @@ PYINC_WORK_EXPECTATIONS: dict[tuple[str, str], WorkExpectation] = {
     ("codegen", "cold"): _work(29, 175, 0, 1, 30, 30, 43, 43),
     ("codegen", "unchanged"): _work(0, 204, 0, 0, 30, 0, 43, 0),
     ("codegen", "comment_only_referenced_edit"): _work(1, 203, 10, 1, 30, 0, 43, 0),
-    ("codegen", "localized_semantic_edit"): _work(6, 205, 10, 1, 30, 0, 43, 0),
-    ("codegen", "high_fanout_shared_edit"): _work(6, 210, 14, 1, 30, 0, 43, 0),
-    ("codegen", "removed_emitted_artifact"): _work(8, 154, 7, 1, 30, 0, 40, -3),
+    ("codegen", "localized_semantic_edit"): _work(6, 207, 10, 1, 30, 0, 43, 0),
+    ("codegen", "high_fanout_shared_edit"): _work(6, 207, 12, 1, 30, 0, 43, 0),
+    ("codegen", "removed_emitted_artifact"): _work(9, 156, 7, 1, 30, 0, 40, -3),
     ("codegen", "tampered_generated_output"): _work(0, 154, 0, 0, 30, 0, 40, 0),
     ("codegen", "checkpoint_restore"): _work(0, 37, 0, 0, 24, 24, 33, 33),
     ("action", "cold"): _work(3, 0, 0, 0, 5, 3, 3, 3),

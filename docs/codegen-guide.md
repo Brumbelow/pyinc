@@ -68,7 +68,11 @@ combinator becomes a type alias.
 Model references use deferred annotations and imports guarded by
 `TYPE_CHECKING`. Aliases store their type expression as a forward-reference
 string. Together these let mutually recursive models import on every supported
-Python version.
+Python version. `typing.get_type_hints` on a model that references another
+model needs the package imported and passed as `localns`, as in
+`get_type_hints(Issue, localns=vars(package))`. A field typed as a union with an
+alias other than an enum still raises `TypeError` there. The alias holds its
+type as a string, so `Labels | None` evaluates as `'list[str]' | None`.
 
 A schema node's shape is selected in the same order everywhere: `$ref`, then a
 combinator, then `enum`, then `const`, and last `type`.
@@ -154,6 +158,21 @@ The subset excludes remote/HTTP `$ref`, general combinators, conditional
 schemas, `patternProperties`, positional (tuple) array types, and instance
 validation. The compiler emits models and reports what it ignores.
 
+These common shapes are refused with an error:
+
+- an object with `properties` in property or `items` position, an inline
+  nested object: `ambiguous-schema-combination`, or `unsupported-construct`
+  when the node declares no `type`. Declare it as a definition and `$ref` it.
+- a `type` list with more than one type besides `null`, such as
+  `["integer", "string"]`: `unsupported-union`
+- `oneOf`, and an `allOf` with more than one branch: `unsupported-construct`
+- a property name that is not a Python identifier, such as `first-name`,
+  `class` or `from`: `unsupported-field-name`. No field is renamed.
+- a model at the document root: `unsupported-root-schema`. Models live under
+  `$defs` or `definitions`.
+
+There is no command-line interface. Call `generate` from Python.
+
 ## Diagnostics
 
 Errors block generation and keep the last valid output tree. Warnings are
@@ -166,21 +185,46 @@ still blocks reconciliation.
 
 | Code | Severity | Raised when |
 |---|---|---|
+| `invalid-json` | error | The file is not UTF-8 or not valid JSON, repeats an object key, holds a non-finite number or an unpaired surrogate, or nests deeper than 256 levels. Pointed at `""`. |
+| `invalid-schema-root` | error | The document is not a JSON object. |
+| `invalid-definitions` | error | `$defs` or `definitions` is not an object. |
+| `duplicate-definition` | error | One name is declared under both `$defs` and `definitions`. Both are reported. |
 | `unsupported-root-schema` | error | A model keyword (`type`, `properties`, `required`, `items`, `enum`, `const`, `$ref`) or an unrecognized keyword sits at the document root. One diagnostic, pointed at `""`, names every such keyword. |
 | `unsupported-construct` | error | A combinator the subset does not compile (multi-branch `allOf`, an `anyOf` that is not one schema plus `{"type": "null"}`, `oneOf`, `not`), a conditional, `patternProperties`, `prefixItems`, `unevaluatedProperties`, or schema-valued `additionalProperties` in definition position. |
-| `unknown-ref` | error | A `$ref` names no definition, including a definition removed without updating its referrers. |
+| `ambiguous-schema-combination` | error | A node pairs keywords that select different shapes. `$ref`, `allOf` or `anyOf` sits beside any keyword other than an annotation or an ignored keyword, as in `{"$ref": "#/$defs/A", "type": "string"}`. `enum` or `const` sits beside `items`, `properties`, `required` or each other. The node's `type` does not take a shape keyword it carries, such as `properties` on an object in property or `items` position, or `items` on a string. A definition with `properties` declares a `type` other than `object`. |
+| `invalid-schema-node` | error | A nested schema node is neither an object nor a boolean. |
+| `unsupported-boolean-schema` | error | A definition or a nested node is the boolean schema `true` or `false`. |
+| `invalid-type` | error | `type` is neither a string nor a list, for example `null` or a number. |
+| `unsupported-type` | error | `type` names a type other than `string`, `integer`, `number`, `boolean`, `null`, `array` or `object`. |
+| `unsupported-union` | error | A `type` list is anything but one type plus `"null"`, such as `["integer", "string"]`, an empty list, or a list holding a non-string. |
+| `unknown-ref` | error | A `$ref` names no definition in the section it points into. This includes a definition removed without updating its referrers, and one declared under the other section (`#/$defs/A` for an `A` under `definitions`). |
+| `invalid-ref` | error | `$ref` is not a string. |
+| `unsupported-ref` | error | `$ref` is not a direct local reference `#/$defs/X` or `#/definitions/X`: a remote reference, a deeper pointer, or a malformed escape. |
+| `unsupported-ref-name` | error | `$ref` resolves to a definition whose name is not a Python identifier. |
 | `unsupported-tuple-items` | error | `items` is an array (the draft-07 tuple form). |
 | `self-referential-alias` | error | An alias names only itself, in any spelling: a bare self `$ref`, a single-branch `allOf`, or a nullable `anyOf`. |
 | `alias-cycle` | error | Aliases close a loop with no model or container between them. Each member is reported, with the cycle anchored at its alphabetically first member. |
-| `reserved-definition-name` | error | A definition is named after one of the emitter's fixed imports (`dataclass`, `Literal`, `TypeAlias`, `TYPE_CHECKING`, `Never`) or the builtins its type expressions spell (`str`, `int`, `float`, `bool`, `list`, `dict`, `object`), compared after NFKC normalization. |
-| `reserved-field-name` | error | A property is named after one of those, or after a data-model name such as `__dict__`, `__slots__`, or `__weakref__`. |
+| `invalid-definition` | error | A definition is not a schema object, for example a number or a string. |
+| `unsupported-definition-name` | error | A definition name is not a Python identifier or is a keyword (`first-name`, `class`). |
+| `missing-definition` | error | `definition_model` is asked for a name the document does not declare. `schema_analysis` and `generate` never ask for one. |
+| `reserved-definition-name` | error | A definition is named after one of the emitter's fixed imports (`annotations`, `dataclass`, `Literal`, `TypeAlias`, `TYPE_CHECKING`, `Never`) or the builtins its type expressions spell (`str`, `int`, `float`, `bool`, `list`, `dict`, `object`), compared after NFKC normalization. |
+| `reserved-field-name` | error | A property is named after one of those other than `annotations`, after a model class its definition references (a `Tag` property beside a `$ref` to `Tag`), or after a data-model name such as `__dict__`, `__slots__`, or `__weakref__`. |
+| `invalid-properties` | error | `properties` is not an object. |
+| `unsupported-field-name` | error | A property name is not a Python identifier or is a keyword (`first-name`, `class`, `from`). No field is renamed. |
+| `field-name-collision` | error | Two property names normalize to the same Python name under NFKC (`ﬁ` beside `fi`). Both are reported. |
+| `invalid-required` | error | `required` is not an array of strings. |
+| `duplicate-required-name` | error | `required` repeats a name. |
+| `unsupported-required-property` | error | `required` names a property that has no schema under `properties`. |
 | `module-name-collision` | error | Two definitions produce the same portable module name after Unicode normalization, snake-casing, and case folding (`HTTPServer` beside `http_server`). Both are reported. |
 | `invalid-module-name`, `reserved-module-name`, `nonportable-module-name` | error | The snake-cased module stem is a keyword or not an identifier (`Class`), would occupy the generated `__init__.py`, or is a Windows-reserved device name (`CON`) or longer than portable filename limits. |
 | `const-type-mismatch`, `enum-type-mismatch` | error | A `const` or `enum` member contradicts the declared `type`. A nullable union accepts both the named type and `null`. |
 | `unsupported-const-value`, `unsupported-enum-value` | error | A member is not a string, integer, boolean, or `null`. PEP 586 allows no `float` in a `Literal`. |
 | `empty-enum`, `duplicate-enum-value` | error | An `enum` has no members, or repeats one. |
+| `invalid-enum` | error | `enum` is not an array. |
+| `unsupported-enum-type` | error | An `enum` definition declares a `type` other than `string`, `integer`, `number`, `boolean` or `null`, alone or paired with `null`. |
 | `invalid-constraint` | error | An ignored keyword carries a malformed value (`"minItems": -1`, `"format": 7`, `"multipleOf": 0`). |
 | `invalid-description` | error | A `description` is not a string, on any node including a null branch. |
+| `invalid-annotation` | error | `title` or `$comment` on any node, or `$id` or `$schema` at the root, is not a string. |
 | `ignored-constraint` | warning | An annotation- or validation-only keyword from the table above is present. The type is unchanged. |
 | `unconstrained-object-model` | warning | A definition declares `type: object` with no `properties` keyword, so a `$ref` to it types instance data away. |
 | `unconstrained-schema` | warning | An explicitly unconstrained schema node is represented as `object`. |
@@ -222,5 +266,7 @@ bytes the same. `A` then backdates, and its file stays as it is.
 
 Reference existence is tracked per referenced definition. A single dependency
 on the complete name set would make adding or removing an unrelated definition
-revalidate every model. The reference graph defines what is revalidated.
-Content hashing defines what is rewritten.
+revalidate every model. A model reads the pointer where each target is
+declared and none of its content, so an edit inside a target leaves the
+referrer's `definition_model` as it is. The reference graph defines what is
+revalidated. Content hashing defines what is rewritten.

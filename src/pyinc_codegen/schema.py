@@ -87,10 +87,12 @@ _WINDOWS_RESERVED_MODULE_STEMS = frozenset(
 # class with one of these names would shadow the binding in every module that
 # imports it under ``TYPE_CHECKING``. A field with one shadows it for the rest
 # of its class body and silently changes what the other annotations mean.
+# ``annotations`` is the exception for fields: no annotation spells it.
 # Keep this in sync with the emitter.
 _EMITTER_BOUND_NAMES = frozenset(
     {
         # Fixed imports.
+        "annotations",
         "dataclass",
         "Literal",
         "TypeAlias",
@@ -346,21 +348,21 @@ def _percent_decode(value: str) -> str | None:
         return None
 
 
-def _local_ref_target(ref: str) -> tuple[str | None, str | None]:
-    """Return ``(target, problem)`` for the supported local reference shape."""
+def _local_ref_target(ref: str) -> tuple[str | None, str | None, str | None]:
+    """Return ``(section, target, problem)`` for the supported local reference shape."""
 
     if not ref.startswith("#/"):
-        return (None, "only local $defs/definitions references are supported")
+        return (None, None, "only local $defs/definitions references are supported")
     decoded_fragment = _percent_decode(ref[1:])
     if decoded_fragment is None:
-        return (None, "the URI fragment contains invalid percent-encoded UTF-8")
+        return (None, None, "the URI fragment contains invalid percent-encoded UTF-8")
     raw_segments = decoded_fragment[1:].split("/")
     segments = tuple(_decode_pointer_segment(segment) for segment in raw_segments)
     if any(segment is None for segment in segments):
-        return (None, "the JSON Pointer contains an invalid '~' escape")
+        return (None, None, "the JSON Pointer contains an invalid '~' escape")
     if len(segments) != 2 or segments[0] not in _DEFINITION_SECTIONS:
-        return (None, "only direct references into $defs or definitions are supported")
-    return (segments[1], None)
+        return (None, None, "only direct references into $defs or definitions are supported")
+    return (segments[0], segments[1], None)
 
 
 def _annotation_diagnostics(
@@ -579,7 +581,7 @@ def _is_null_schema(branch: object) -> bool:
 def _render_combinator(
     keyword: str,
     branches: object,
-    definition_exists: Callable[[str], bool],
+    definition_exists: Callable[[str, str], bool],
     json_pointer: str,
 ) -> tuple[str, tuple[str, ...], tuple[DiagnosticPayload, ...], bool]:
     """Render the two supported combinator spellings. Each names one type."""
@@ -635,7 +637,7 @@ def _render_combinator(
 
 def _render_type(
     spec: object,
-    definition_exists: Callable[[str], bool],
+    definition_exists: Callable[[str, str], bool],
     json_pointer: str,
     *,
     validate_current: bool = True,
@@ -694,14 +696,14 @@ def _render_type(
         )
         return ("object", (), tuple(diagnostics), False)
     if isinstance(ref, str):
-        target, problem = _local_ref_target(ref)
+        section, target, problem = _local_ref_target(ref)
         if problem is not None:
             diagnostics.append(
                 _diagnostic("unsupported-ref", problem, _pointer(json_pointer, "$ref"))
             )
             return ("object", (), tuple(diagnostics), False)
-        assert target is not None
-        if not definition_exists(target):
+        assert section is not None and target is not None
+        if not definition_exists(section, target):
             diagnostics.append(
                 _diagnostic(
                     "unknown-ref",
@@ -1067,7 +1069,7 @@ def _field_collision_diagnostics(
 def _build_model(
     name: str,
     fragment: object,
-    definition_exists: Callable[[str], bool],
+    definition_exists: Callable[[str, str], bool],
     json_pointer: str,
 ) -> ModelPayload:
     name_diagnostics: tuple[DiagnosticPayload, ...] = (
@@ -1176,6 +1178,7 @@ def _build_model(
             )
 
         fields: list[FieldPayload] = []
+        field_pointers: list[str] = []
         refs: set[str] = set()
         for property_name in sorted(properties):
             property_pointer = _pointer(properties_pointer, property_name)
@@ -1197,7 +1200,10 @@ def _build_model(
                     ),
                 )
                 continue
-            if _shadows_emitter_binding(property_name):
+            if (
+                _shadows_emitter_binding(property_name)
+                and _python_identifier(property_name) != "annotations"
+            ):
                 # A field binds its name in the class body, so every later
                 # annotation there resolves to the field instead of the import
                 # or builtin. Rejected like a definition name that shadows the
@@ -1227,8 +1233,24 @@ def _build_model(
                     allows_none,
                 )
             )
+            field_pointers.append(property_pointer)
             refs.update(property_refs)
             diagnostics += property_diagnostics
+        # A field named like a model this definition references binds the
+        # class name in the class body, so an annotation below it names the
+        # field. Sorting and requiredness decide which comes first, so the name
+        # is refused wherever the field falls.
+        referenced_classes = {_python_identifier(ref) for ref in refs}
+        for field, field_pointer in zip(fields, field_pointers, strict=True):
+            if field[0] in referenced_classes:
+                diagnostics += (
+                    _diagnostic(
+                        "reserved-field-name",
+                        "property name shadows a model class this definition references: "
+                        f"{field[0]!r}",
+                        field_pointer,
+                    ),
+                )
         return (
             name,
             "object",
@@ -1513,6 +1535,18 @@ def definition_pointer(db: Database, path: str, name: str) -> str:
 
 
 @query
+def definition_declared(db: Database, path: str, section: str, name: str) -> bool:
+    """Whether ``section`` declares ``name``, read without the definition's content."""
+
+    try:
+        data = _load(schema_text(db, path))
+    except (json.JSONDecodeError, ValueError):
+        return False
+    entries = data.get(section) if isinstance(data, dict) else None
+    return isinstance(entries, dict) and name in entries
+
+
+@query
 def definition_model(db: Database, path: str, name: str) -> ModelPayload:
     raw = definition_raw(db, path, name)
     json_pointer = definition_pointer(db, path, name)
@@ -1528,8 +1562,14 @@ def definition_model(db: Database, path: str, name: str) -> ModelPayload:
             (_diagnostic("missing-definition", f"definition {name!r} does not exist", ""),),
         )
 
-    def definition_exists(target: str) -> bool:
-        return bool(definition_raw(db, path, target))
+    def definition_exists(section: str, target: str) -> bool:
+        # A reference resolves only in the section it names. Neither read takes
+        # the target's content, so an edit inside the target leaves this model.
+        declared_at = definition_pointer(db, path, target)
+        if declared_at == _pointer("", section, target):
+            return True
+        # A name declared in both sections points into the first one only.
+        return bool(declared_at) and definition_declared(db, path, section, target)
 
     return _build_model(name, _load(raw), definition_exists, json_pointer)
 
