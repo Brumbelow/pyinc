@@ -6,6 +6,8 @@ scan dominates the runtime of anything that builds a session.
 
 Tests that check the repository itself are marked ``process`` by file name, so
 the cross-platform matrix can skip them and the quality job can run them once.
+A slow test that gives the same result in every cell carries the mark itself:
+the analysis of pyinc's own source and the snapshot decode scaling test.
 
 ``PYINC_TEST_SHARD``, written ``K/N``, keeps shard K of N. CI runs one cell as
 several jobs this way. Unset, every collected test runs.
