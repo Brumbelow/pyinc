@@ -7320,6 +7320,113 @@ def test_resource_memo_sees_its_module_file_saved(
     assert warm == fresh != before
 
 
+_STDLIB_NAMED_RESOURCE_SOURCE = """\
+from pyinc import Resource
+
+
+def shape_v2(self, key):
+    return "v2[" + key + "]"
+
+
+class Api(Resource):
+    BASE = "v1:"
+
+    def identity(self):
+        return "api"
+
+    def label(self, key):
+        return "api[" + key + "]"
+
+    def probe(self, key):
+        return ("present",)
+
+    def _shape(self, key):
+        return "v1[" + key + "]"
+
+    def load(self, db, key):
+        return self.BASE + self._shape(key)
+
+
+API = Api()
+"""
+
+
+_STDLIB_NAMED_HOLDER_SOURCE = """\
+from pyinc import Resource
+from _RESOURCE_MODULE_ import API
+
+
+class Holder(Resource):
+    def identity(self):
+        return "holder"
+
+    def label(self, key):
+        return "holder[" + key + "]"
+
+    def probe(self, key):
+        return ("present",)
+
+    def load(self, db, key):
+        return "holder:" + API.load(db, key)
+"""
+
+
+def _read_outcome(db: Database, resource: Any) -> str:
+    try:
+        return repr(db.read_resource(resource, "users"))
+    except UnsupportedValueError as exc:
+        return f"refused: {exc}"
+
+
+@pytest.mark.parametrize("change", ["class-constant", "helper-method", "reload"])
+@pytest.mark.parametrize("nested", [False, True], ids=["resource", "nested-resource"])
+@pytest.mark.parametrize("name", ["profile", "profiles"])
+def test_resource_memo_walks_a_class_whose_module_shadows_a_standard_library_name(
+    name: str, nested: bool, change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller's top-level module can carry a standard-library name.
+
+    The identity fold walks the class of a resource defined there, and of a
+    resource another one reads. The memo pinned such a class by its module
+    name, so a changed class constant, helper method or reload kept serving
+    the old value. `profiles` is a name the standard library does not use.
+    """
+
+    assert (name in sys.stdlib_module_names) == (name == "profile")
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    holder_name = f"pyinc_memo_{name}_holder"
+    (tmp_path / f"{name}.py").write_text(_STDLIB_NAMED_RESOURCE_SOURCE, encoding="utf-8")
+    (tmp_path / f"{holder_name}.py").write_text(
+        _STDLIB_NAMED_HOLDER_SOURCE.replace("_RESOURCE_MODULE_", name), encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    saved = sys.modules.pop(name, None)
+    try:
+        module = importlib.import_module(name)
+        assert Path(cast(str, module.__file__)).parent == tmp_path
+        resource = importlib.import_module(holder_name).Holder() if nested else module.API
+        db = Database()
+        key = db._resource_key(resource, "users")
+        assert db._resource_identity_memo[id(resource)].resource is resource
+        # The second call is a memo hit, so the guard runs. Its key must be
+        # the one the fold derived.
+        assert db._resource_key(resource, "users") == key
+        assert Database()._resource_key(resource, "users") == key
+        before = _read_outcome(db, resource)
+        if change == "class-constant":
+            module.Api.BASE = "v2:"
+        elif change == "helper-method":
+            module.Api._shape = module.shape_v2
+        else:
+            importlib.reload(module)
+        assert _read_outcome(db, resource) == _read_outcome(Database(), resource) != before
+    finally:
+        sys.modules.pop(name, None)
+        sys.modules.pop(holder_name, None)
+        if saved is not None:
+            sys.modules[name] = saved
+
+
 def test_a_resource_memo_hit_calls_identity_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

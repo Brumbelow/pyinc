@@ -5885,6 +5885,7 @@ class Database:
         def observe_type(cls: type[Any]) -> Any:
             if cls.__module__ == "builtins" or (
                 cls.__module__.partition(".")[0] in sys.stdlib_module_names
+                and runtime_pinned_type(cls)
             ):
                 # Mirrors _type_definition_payload: builtin and stdlib types
                 # are pinned by name anchor and runtime build, never by a
@@ -5899,6 +5900,20 @@ class Database:
                 tuple(observe_type(base) for base in cls.__bases__),
                 tuple((name, observe_value(item)) for name, item in sorted(vars(cls).items())),
                 observe_binding(cls),
+            )
+
+        def runtime_pinned_type(cls: type[Any]) -> bool:
+            # A caller's own top-level module can carry a standard-library
+            # name, as a profile.py or a queue.py does. The resource identity
+            # fold walks a class defined there, so the class is a leaf only
+            # when the runtime build pins its module. A module or spec that
+            # cannot be found means the class is walked.
+            module = sys.modules.get(cls.__module__)
+            specification = getattr(module, "__spec__", None)
+            return (
+                module is not None
+                and isinstance(specification, importlib.machinery.ModuleSpec)
+                and Database._is_runtime_pinned_module(module, specification)
             )
 
         def observe_binding(cls: type[Any]) -> Any:
