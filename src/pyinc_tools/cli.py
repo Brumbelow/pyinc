@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 from collections.abc import Sequence
 from dataclasses import asdict
+from pathlib import Path
 
 from .lsp import LanguageServer, _package_version
 from .session import (
@@ -29,6 +31,25 @@ _SEVERITY_RANK: dict[str, int] = {"error": 0, "warning": 1, "information": 2, "h
 _FAIL_ON_NEVER = "none"
 
 
+def _int_at_least(text: str, minimum: int) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < minimum:
+        raise argparse.ArgumentTypeError(f"must be at least {minimum}, got {value}")
+    return value
+
+
+def _non_negative_int(text: str) -> int:
+    return _int_at_least(text, 0)
+
+
+def _positive_int(text: str) -> int:
+    # A zero poll interval would make the watcher spin on the CPU.
+    return _int_at_least(text, 1)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pyinc-tools")
     parser.add_argument(
@@ -46,14 +67,18 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Poll for file changes and re-run analysis.",
     )
-    analyze.add_argument("--debounce-ms", type=int, default=200, help="Watcher debounce window.")
+    analyze.add_argument(
+        "--debounce-ms", type=_non_negative_int, default=200, help="Watcher debounce window."
+    )
     analyze.add_argument(
         "--poll-interval-ms",
-        type=int,
+        type=_positive_int,
         default=None,
         help="Watcher poll cadence (defaults to half the debounce window).",
     )
-    analyze.add_argument("--indent", type=int, default=2, help="JSON indentation level.")
+    analyze.add_argument(
+        "--indent", type=_non_negative_int, default=2, help="JSON indentation level."
+    )
     analyze.add_argument(
         "--format",
         dest="output_format",
@@ -80,6 +105,28 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _emit_json(payload: object, *, indent: int) -> None:
     print(json.dumps(payload, indent=indent, sort_keys=True), flush=True)
+
+
+def _discard_stdout() -> None:
+    """Point stdout at the null device once the reader has closed the pipe.
+
+    The interpreter flushes stdout on exit. A flush into the closed pipe would
+    fail again and print the error to stderr.
+    """
+
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, sys.stdout.fileno())
+    finally:
+        os.close(devnull)
+
+
+def _require_file(session: WorkspaceSession, path: str) -> None:
+    # Analysis of a path with no file behind it returns an empty result, which
+    # would let a mistyped path pass a CI gate.
+    real_path = session._normalize_real_path(path)
+    if not Path(real_path).is_file():
+        raise FileNotFoundError(f"{real_path} is not an existing file.")
 
 
 def _analyze_once(session: WorkspaceSession, path: str | None) -> AnalysisResult:
@@ -169,6 +216,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return EXIT_ERROR
         with session_context as session:
             try:
+                if args.path is not None:
+                    _require_file(session, args.path)
                 result = _analyze_once(session, args.path)
                 _emit_result(
                     result,
@@ -176,6 +225,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     diagnostics_only=args.diagnostics_only,
                     indent=args.indent,
                 )
+            except BrokenPipeError:
+                _discard_stdout()
+                return EXIT_ERROR
             except (OSError, ValueError) as exc:
                 print(f"pyinc-tools: {exc}", file=sys.stderr)
                 return EXIT_ERROR
@@ -190,31 +242,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else max(args.debounce_ms / 1000.0 / 2.0, 0.05)
             )
             watcher = PollingWorkspaceWatcher(session, debounce_ms=args.debounce_ms)
-            idle_event = threading.Event()
+            stop_event = threading.Event()
+            exit_status = EXIT_SUCCESS
 
             def _on_change(changed: tuple[str, ...]) -> None:
+                nonlocal exit_status
                 changed_result = _analyze_once(session, args.path)
-                if args.output_format == "text":
-                    print(f"# changed: {' '.join(changed)}", flush=True)
-                    _emit_text(_sorted_diagnostics(changed_result))
-                    return
-                payload = (
-                    [asdict(item) for item in _sorted_diagnostics(changed_result)]
-                    if args.diagnostics_only
-                    else asdict(changed_result)
-                )
-                _emit_json(
-                    {"changed_paths": list(changed), "analysis": payload},
-                    indent=args.indent,
-                )
+                try:
+                    if args.output_format == "text":
+                        print(f"# changed: {' '.join(changed)}", flush=True)
+                        _emit_text(_sorted_diagnostics(changed_result))
+                        return
+                    payload = (
+                        [asdict(item) for item in _sorted_diagnostics(changed_result)]
+                        if args.diagnostics_only
+                        else asdict(changed_result)
+                    )
+                    _emit_json(
+                        {"changed_paths": list(changed), "analysis": payload},
+                        indent=args.indent,
+                    )
+                except BrokenPipeError:
+                    # Nothing can read later results, so watching ends here.
+                    _discard_stdout()
+                    exit_status = EXIT_ERROR
+                    stop_event.set()
 
             with watcher:
                 watcher.start(_on_change, interval_s=interval_s)
                 try:
-                    idle_event.wait()
+                    stop_event.wait()
                 except KeyboardInterrupt:
                     return EXIT_SUCCESS
-            return EXIT_SUCCESS
+            return exit_status
 
     server = LanguageServer(default_root=args.root)
     return server.serve()

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -85,6 +88,9 @@ class _Session:
         self.analyzed_paths.append(path)
         return _AnalysisResult("file", path)
 
+    def _normalize_real_path(self, path: str) -> str:
+        return str(Path(self.root, path))
+
 
 class _Watcher:
     instances: list[_Watcher] = []
@@ -137,17 +143,21 @@ def session_factory(monkeypatch: pytest.MonkeyPatch) -> list[_Session]:
     return sessions
 
 
+def _workspace_with_module(root: Path) -> str:
+    (root / "pkg").mkdir()
+    (root / "pkg" / "mod.py").write_text("value = 1\n", encoding="utf-8")
+    return str(root)
+
+
 def test_main_analyzes_workspace_and_file(
-    session_factory: list[_Session], capsys: pytest.CaptureFixture[str]
+    session_factory: list[_Session], capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    assert cli.main(["analyze", "/workspace", "--indent", "0"]) == cli.EXIT_SUCCESS
+    root = _workspace_with_module(tmp_path)
+    assert cli.main(["analyze", root, "--indent", "0"]) == cli.EXIT_SUCCESS
     workspace_payload = json.loads(capsys.readouterr().out)
     assert workspace_payload == {"kind": "workspace", "path": None}
 
-    assert (
-        cli.main(["analyze", "/workspace", "--path", "pkg/mod.py", "--indent", "0"])
-        == cli.EXIT_SUCCESS
-    )
+    assert cli.main(["analyze", root, "--path", "pkg/mod.py", "--indent", "0"]) == cli.EXIT_SUCCESS
     file_payload = json.loads(capsys.readouterr().out)
     assert file_payload == {"kind": "file", "path": "pkg/mod.py"}
     assert session_factory[1].analyzed_paths == ["pkg/mod.py"]
@@ -198,6 +208,7 @@ def test_main_watch_emits_changes_and_selects_poll_interval(
     session_factory: list[_Session],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     _Watcher.instances.clear()
     _Watcher.change = ("/workspace/a.py", "/workspace/b.py")
@@ -207,7 +218,7 @@ def test_main_watch_emits_changes_and_selects_poll_interval(
 
     arguments = [
         "analyze",
-        "/workspace",
+        _workspace_with_module(tmp_path),
         "--path",
         "pkg/mod.py",
         "--watch",
@@ -483,3 +494,154 @@ def test_emit_json_sorts_keys_and_flushes(monkeypatch: pytest.MonkeyPatch) -> No
     cli._emit_json({"z": 1, "a": 2}, indent=0)
 
     assert observed == [('{\n"a": 2,\n"z": 1\n}', True)]
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--poll-interval-ms", "0"),
+        ("--poll-interval-ms", "-5"),
+        ("--debounce-ms", "-1"),
+        ("--indent", "-1"),
+    ],
+)
+def test_numbers_below_their_minimum_are_usage_errors(
+    flag: str,
+    value: str,
+    session_factory: list[_Session],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["analyze", "/workspace", flag, value])
+
+    assert raised.value.code == cli.EXIT_USAGE
+    error = capsys.readouterr().err
+    assert f"argument {flag}: must be at least" in error
+    assert session_factory == []
+
+
+def test_numbers_at_their_minimum_are_accepted() -> None:
+    args = cli._build_parser().parse_args(
+        ["analyze", "/workspace", "--poll-interval-ms", "1", "--debounce-ms", "0", "--indent", "0"]
+    )
+
+    assert (args.poll_interval_ms, args.debounce_ms, args.indent) == (1, 0, 0)
+
+
+@pytest.mark.parametrize("name", ["missing.py", "pkg"])
+def test_path_that_is_not_an_existing_file_exits_1_and_names_it(
+    name: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _workspace_with_module(root)
+
+    assert cli.main(["analyze", str(root), "--path", name]) == cli.EXIT_ERROR
+    output = capsys.readouterr()
+    assert output.out == ""
+    expected = root.resolve() / name
+    assert output.err == f"pyinc-tools: {expected} is not an existing file.\n"
+
+
+class _ClosedPipeStdout:
+    """Stands in for stdout on a pipe whose reader has gone.
+
+    `fileno` names a file the test owns, so the handler can point it at the
+    null device without touching the stdout pytest captures.
+    """
+
+    def __init__(self, fd: int, *, closed: bool) -> None:
+        self.fd = fd
+        self.closed_by_reader = closed
+        self.written: list[str] = []
+
+    def write(self, text: str) -> int:
+        if self.closed_by_reader:
+            raise BrokenPipeError(32, "Broken pipe")
+        self.written.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if self.closed_by_reader:
+            raise BrokenPipeError(32, "Broken pipe")
+
+    def fileno(self) -> int:
+        return self.fd
+
+
+@pytest.fixture()
+def stdout_fd(tmp_path: Path) -> Iterator[int]:
+    fd = os.open(tmp_path / "stdout", os.O_WRONLY | os.O_CREAT)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _points_at_null_device(fd: int) -> bool:
+    return os.path.samestat(os.fstat(fd), os.stat(os.devnull))
+
+
+def test_closed_pipe_exits_1_quietly(
+    session_factory: list[_Session],
+    stdout_fd: int,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "stdout", _ClosedPipeStdout(stdout_fd, closed=True))
+
+    assert cli.main(["analyze", "/workspace"]) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == ""
+    assert _points_at_null_device(stdout_fd)
+    assert session_factory[0].exited
+
+
+def test_closed_pipe_ends_watch_mode_quietly(
+    session_factory: list[_Session],
+    stdout_fd: int,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stdout = _ClosedPipeStdout(stdout_fd, closed=False)
+
+    class ReaderClosesWatcher(_Watcher):
+        def start(
+            self,
+            on_change: Callable[[tuple[str, ...]], None],
+            *,
+            interval_s: float,
+        ) -> None:
+            stdout.closed_by_reader = True
+            super().start(on_change, interval_s=interval_s)
+
+    _Watcher.instances.clear()
+    _Watcher.change = ("/workspace/a.py",)
+    monkeypatch.setattr(cli, "PollingWorkspaceWatcher", ReaderClosesWatcher)
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    assert cli.main(["analyze", "/workspace", "--watch", "--indent", "0"]) == cli.EXIT_ERROR
+    assert capsys.readouterr().err == ""
+    assert json.loads("".join(stdout.written)) == {"kind": "workspace", "path": None}
+    assert _points_at_null_device(stdout_fd)
+    assert _Watcher.instances[-1].exited
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pipe semantics")
+def test_closed_pipe_prints_nothing_to_stderr(tmp_path: Path) -> None:
+    root = _workspace_with_module(tmp_path)
+    read_fd, write_fd = os.pipe()
+    # With the read end closed before the process starts, its first write
+    # into the pipe fails, however little it prints.
+    os.close(read_fd)
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pyinc_tools", "analyze", root],
+            stdout=write_fd,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    finally:
+        os.close(write_fd)
+
+    assert completed.stderr == b""
+    assert completed.returncode == cli.EXIT_ERROR
