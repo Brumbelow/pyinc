@@ -251,3 +251,9 @@ def test_the_sdist_carries_the_security_and_contributing_guides() -> None:
     sdist = _shipped_project()["tool"]["hatch"]["build"]["targets"]["sdist"]
 
     assert {"/SECURITY.md", "/CONTRIBUTING.md"} <= set(sdist["include"])
+
+
+def test_the_sdist_carries_the_constraints_file_its_tests_read() -> None:
+    sdist = _shipped_project()["tool"]["hatch"]["build"]["targets"]["sdist"]
+
+    assert "/constraints.txt" in sdist["include"]

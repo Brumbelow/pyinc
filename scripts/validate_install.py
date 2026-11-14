@@ -47,6 +47,7 @@ def _validate_sdist(archive_path: Path, version: str) -> None:
         f"{prefix}/bench/__init__.py",
         f"{prefix}/bench/harness.py",
         f"{prefix}/bench/run.py",
+        f"{prefix}/constraints.txt",
         f"{prefix}/docs/getting-started.md",
         f"{prefix}/docs/lsp-reference.md",
         f"{prefix}/scripts/__init__.py",
