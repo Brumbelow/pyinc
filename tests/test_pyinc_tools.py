@@ -1194,6 +1194,7 @@ def test_lsp_close_and_watched_file_notifications_refresh_diagnostics(tmp_path: 
             "workspace/didChangeWatchedFiles",
             {"changes": [{"type": 2}, {"uri": uri, "type": 2}]},
         )
+        assert server.wait_idle(120)
         assert _workspace_symbol_names(server, "watched") == {"watched"}
         assert _published_diagnostics(out) == [
             (uri, ("missing-import",)),
@@ -1203,6 +1204,7 @@ def test_lsp_close_and_watched_file_notifications_refresh_diagnostics(tmp_path: 
 
         assert server._handle_notification("workspace/didChangeWatchedFiles", {"changes": []})
         assert server._handle_notification("unknown/notification", {})
+        assert server.wait_idle(120)
         assert len(_published_diagnostics(out)) == 3
     finally:
         if server._session is not None:
@@ -2598,8 +2600,8 @@ def test_publish_whose_session_was_torn_down_during_analysis_sends_nothing(
 ) -> None:
     """Diagnostics for a session the server has stopped serving are dropped.
 
-    A watcher join that times out leaves the thread analyzing after teardown
-    has moved on. The diagnostics it then sent described a closed session,
+    A join of the diagnostics worker that times out leaves it analyzing after
+    teardown has moved on. The diagnostics it then sent described a closed session,
     possibly after the shutdown response.
     """
 
@@ -2678,7 +2680,7 @@ def _race_watcher_publish_with_edit(server: LanguageServer, path: Path, text: st
         on_watcher.active = True
         try:
             server.publish_workspace_diagnostics()
-        except Exception as exc:  # recorded: the watcher reports it on stderr
+        except Exception as exc:  # recorded: the diagnostics worker reports it on stderr
             errors.append(f"{type(exc).__name__}: {exc}")
 
     def request_loop_edit() -> None:

@@ -498,3 +498,69 @@ def test_watcher_and_did_change_publish_in_the_order_their_analyses_ran(
     assert [uri for uri, _messages in published] == [other.as_uri(), app.as_uri()]
     assert "'missing_b'" in published[0][1][0]
     assert "'missing_c'" in published[1][1][0]
+
+
+def test_watched_files_notification_analyzes_on_the_worker(
+    watched: tuple[_WatchedServer, Path],
+) -> None:
+    """didChangeWatchedFiles refreshes the paths and returns before the analysis.
+
+    It used to analyze the whole workspace on the request thread, so the
+    request loop read no other message until that analysis ended.
+    """
+
+    harness, root = watched
+    other = root / "other.py"
+    other.write_text("import missing_w\n", encoding="utf-8")
+    held = harness.hold(holding_session_lock=False)
+    try:
+        harness.notify(
+            "workspace/didChangeWatchedFiles",
+            {"changes": [{"uri": other.as_uri(), "type": 2}]},
+        )
+        assert held.entered.wait(_TIMEOUT)
+        assert not held.finished.is_set()
+    finally:
+        held.release.set()
+    harness.drain()
+
+    assert harness.analysis_threads == ["pyinc-tools-diagnostics"]
+    published = harness.published()
+    assert [uri for uri, _messages in published] == [other.as_uri()]
+    assert "'missing_w'" in published[0][1][0]
+
+
+def test_a_failed_publish_prints_its_traceback_and_the_worker_keeps_publishing(
+    watched: tuple[_WatchedServer, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    harness, root = watched
+    path = root / "app.py"
+    session = harness.server._session
+    assert session is not None
+    analyze = session.analyze_workspace
+    calls = 0
+
+    def fail_first_analysis() -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("mirror unreadable")
+        return analyze()
+
+    monkeypatch.setattr(session, "analyze_workspace", fail_first_analysis)
+    harness.open(path, "import missing_0\n")
+    harness.drain()
+
+    err = capsys.readouterr().err
+    assert "Traceback (most recent call last):" in err
+    assert "OSError: mirror unreadable" in err
+    assert harness.published() == []
+
+    harness.change(path, "import missing_1\n")
+    harness.drain()
+
+    published = harness.published()
+    assert [uri for uri, _messages in published] == [path.as_uri()]
+    assert "'missing_1'" in published[0][1][0]

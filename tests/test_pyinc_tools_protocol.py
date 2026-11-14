@@ -161,6 +161,7 @@ def test_watched_files_batch_refreshes_the_in_root_entries(
 
         assert (mirror / "first.py").read_text(encoding="utf-8") == "x = 2\n"
         assert (mirror / "second.py").read_text(encoding="utf-8") == "y = 2\n"
+        assert server.wait_idle(120)
     finally:
         server._teardown_session()
     assert capsys.readouterr().err == ""
@@ -197,3 +198,108 @@ def test_completion_reports_whether_the_list_was_cut(tmp_path: Path) -> None:
     whole = replies[2]["result"]
     assert whole["isIncomplete"] is False
     assert {item["label"] for item in whole["items"]} == {f"n{index}" for index in range(100, 200)}
+
+
+def _initialize_with(root: Path, request_id: int, options: dict[str, Any]) -> dict[str, Any]:
+    return _request(
+        request_id,
+        "initialize",
+        {"rootUri": root.as_uri(), "initializationOptions": options},
+    )
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        pytest.param("pyinc.watcher.debounceMs", "abc", id="debounce-string"),
+        pytest.param("pyinc.watcher.debounceMs", -1, id="debounce-negative"),
+        pytest.param("pyinc.watcher.debounceMs", True, id="debounce-bool"),
+        pytest.param("pyinc.watcher.debounceMs", 10**400, id="debounce-beyond-float"),
+        pytest.param("pyinc.watcher.intervalMs", 0, id="interval-zero"),
+        pytest.param("pyinc.watcher.intervalMs", "x", id="interval-string"),
+        pytest.param("pyinc.watcher.intervalMs", 10**400, id="interval-beyond-float"),
+    ],
+)
+def test_initialize_refuses_a_bad_watcher_option(
+    option: str, value: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "mod.py").write_text("x = 1\n", encoding="utf-8")
+
+    status, replies = _serve(
+        [
+            _initialize_with(root, 1, {option: value}),
+            _initialize_with(root, 2, {"pyinc.watcher.enabled": False}),
+        ]
+    )
+
+    assert status == 0
+    error = replies[1]["error"]
+    assert error["code"] == -32602
+    assert option in error["message"]
+    assert "capabilities" in replies[2]["result"]
+    assert replies["shutdown"]["result"] is None
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param({"pyinc.watcher.debounceMs": None}, id="debounce-null"),
+        pytest.param({"pyinc.watcher.debounceMs": 50}, id="debounce-number"),
+        pytest.param({"pyinc.watcher.intervalMs": None}, id="interval-null"),
+        pytest.param({"pyinc.watcher.intervalMs": 20.5}, id="interval-number"),
+    ],
+)
+def test_initialize_starts_the_watcher_with_a_null_or_numeric_option(
+    options: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "mod.py").write_text("x = 1\n", encoding="utf-8")
+
+    status, replies = _serve([_initialize_with(root, 1, options)])
+
+    assert status == 0
+    assert "capabilities" in replies[1]["result"]
+    assert replies["shutdown"]["result"] is None
+    assert capsys.readouterr().err == ""
+
+
+def test_linked_editing_answers_null_for_a_use_spelled_with_an_alias(tmp_path: Path) -> None:
+    """The ranges must hold the symbol at the cursor.
+
+    `f()` resolves to `foo`, but its text differs, so its range is left out.
+    The answer used to be the range of `foo()` on the line above, which a
+    client cannot link to an edit at the cursor.
+    """
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.py").write_text("def foo() -> int:\n    return 1\n", encoding="utf-8")
+    consumer = root / "b.py"
+    consumer.write_text("from a import foo, foo as f\n\nfoo()\nf()\n", encoding="utf-8")
+    uri = consumer.as_uri()
+
+    status, replies = _serve(
+        [
+            _initialize(root),
+            _request(
+                1,
+                "textDocument/linkedEditingRange",
+                {"textDocument": {"uri": uri}, "position": {"line": 3, "character": 0}},
+            ),
+            _request(
+                2,
+                "textDocument/linkedEditingRange",
+                {"textDocument": {"uri": uri}, "position": {"line": 2, "character": 1}},
+            ),
+        ]
+    )
+
+    assert status == 0
+    assert replies[1]["result"] is None
+    assert replies[2]["result"] == {
+        "ranges": [{"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 3}}]
+    }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import sys
 import threading
 import traceback
@@ -520,6 +521,19 @@ def _refuse_broad_root(root: Path) -> None:
         )
 
 
+def _is_number(value: object) -> bool:
+    """Whether ``value`` is an int or float with a finite float value. A bool does not count."""
+
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        # The JSON reader accepts an int of up to 4,300 digits, and one beyond
+        # float range has no float value.
+        return False
+
+
 class LanguageServer:
     def __init__(
         self,
@@ -869,7 +883,7 @@ class LanguageServer:
                     continue
             if paths:
                 self._require_session().refresh_paths(paths)
-                self.publish_workspace_diagnostics()
+                self._schedule_diagnostics()
             return True
         return True
 
@@ -1020,6 +1034,18 @@ class LanguageServer:
             and raw_max_files >= 1
             else DEFAULT_MAX_WORKSPACE_FILES
         )
+        # Checked before the session is built, so a refused initialize leaves
+        # nothing to tear down. An absent or null option keeps its default.
+        raw_debounce_ms = options.get("pyinc.watcher.debounceMs")
+        if raw_debounce_ms is not None and not (
+            _is_number(raw_debounce_ms) and raw_debounce_ms >= 0
+        ):
+            raise InvalidParams("pyinc.watcher.debounceMs must be a number 0 or greater")
+        raw_interval_ms = options.get("pyinc.watcher.intervalMs")
+        if raw_interval_ms is not None and not (
+            _is_number(raw_interval_ms) and raw_interval_ms > 0
+        ):
+            raise InvalidParams("pyinc.watcher.intervalMs must be a number greater than 0")
         try:
             try:
                 session = WorkspaceSession(root, exclude_globs=exclude_globs, max_files=max_files)
@@ -1040,13 +1066,8 @@ class LanguageServer:
 
             watcher_enabled = bool(options.get("pyinc.watcher.enabled", True))
             if watcher_enabled:
-                debounce_ms = int(options.get("pyinc.watcher.debounceMs", 200))
-                interval_ms = options.get("pyinc.watcher.intervalMs")
-                interval_s: float | None
-                if isinstance(interval_ms, (int, float)):
-                    interval_s = float(interval_ms) / 1000.0
-                else:
-                    interval_s = None
+                debounce_ms = 200 if raw_debounce_ms is None else int(raw_debounce_ms)
+                interval_s = None if raw_interval_ms is None else float(raw_interval_ms) / 1000.0
                 watcher = PollingWorkspaceWatcher(session, debounce_ms=debounce_ms)
                 self._watcher = watcher
                 watcher.start(self._on_watcher_change, interval_s=interval_s)
@@ -1179,10 +1200,7 @@ class LanguageServer:
                     # without raising then.
                     if isinstance(exc, RuntimeError) and str(exc) == SESSION_CLOSED_MESSAGE:
                         continue
-                    print(
-                        f"pyinc-tools lsp: publishDiagnostics raised: {type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
+                    _log_handler_error("textDocument/publishDiagnostics", "notification")
         finally:
             # `_take_diagnostics_run` clears the thread when it ends the loop.
             # This covers an exception that escaped the loop.
@@ -1513,6 +1531,12 @@ class LanguageServer:
         except FileNotFoundError:
             return None
         if not ranges:
+            return None
+        # The ranges must hold the symbol at the cursor. A use spelled with an
+        # import alias resolves to the symbol but is left out of its ranges,
+        # so nothing at the cursor can be linked.
+        cursor = SourcePosition(line, character)
+        if not any(item.range.contains(cursor, include_end=True) for item in ranges):
             return None
         return {"ranges": [_range_to_lsp(editing_range.range) for editing_range in ranges]}
 
