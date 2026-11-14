@@ -2736,15 +2736,16 @@ def test_publishes_reach_the_client_in_the_order_their_analyses_ran(
         server._teardown_session()
 
 
-def test_diagnostic_skipped_for_a_stale_range_is_sent_when_it_comes_back(
+def test_diagnostic_sent_for_a_stale_range_is_sent_again_when_it_comes_back(
     tmp_path: Path,
 ) -> None:
-    """A path skipped for a stale range is published by a later publish.
+    """A diagnostic cleared after a stale publish is published when it returns.
 
     The watcher's analysis found a new diagnostic in a.py after b.py changed
     on disk. The request loop shortened a.py before that publish sent it, so
-    the range overran the edited line and its conversion raised. The publish
-    used to record the signature first. When an edit brought the same
+    the range overran the edited line. The publish sends it moved inside the
+    line, and the edit's publish clears it. A publish used to record the
+    signature before its send raised. When an edit brought the same
     diagnostic back, it counted as sent and the client never received it.
     """
 
@@ -2770,11 +2771,11 @@ def test_diagnostic_skipped_for_a_stale_range_is_sent_when_it_comes_back(
 
         errors = _race_watcher_publish_with_edit(server, path, "x = 1\n")
 
-        assert _diagnostic_publications(out) == []
+        uri = path.resolve().as_uri()
+        assert _diagnostic_publications(out) == [(uri, ["unresolved-symbol"]), (uri, [])]
         _did_change(server, path, broken)
         assert server.wait_idle(120)
-        uri = path.resolve().as_uri()
-        assert _diagnostic_publications(out) == [(uri, ["unresolved-symbol"])]
+        assert _diagnostic_publications(out)[2:] == [(uri, ["unresolved-symbol"])]
         assert errors == []
     finally:
         server._teardown_session()

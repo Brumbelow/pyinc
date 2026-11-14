@@ -653,6 +653,20 @@ def _decode_range(payload: RangePayload) -> SourceRange:
     )
 
 
+def _position_in_document(document: DocumentMap, position: SourcePosition) -> SourcePosition:
+    """Return the nearest position the document holds.
+
+    A line past the last one moves to the end of the last line. A column past
+    the end of its line moves to that end.
+    """
+
+    last = len(document.lines) - 1
+    if position.line > last:
+        return SourcePosition(last, len(document.lines[last]))
+    length = len(document.lines[position.line])
+    return SourcePosition(position.line, min(position.character, length))
+
+
 @query
 def source_ranges_for_file(db: Database, path: str) -> FileSourceRangesPayload:
     source = source_text(db, path)
@@ -671,6 +685,12 @@ def source_ranges_for_file(db: Database, path: str) -> FileSourceRangesPayload:
         )
         if end <= start:
             end = SourcePosition(start.line, start.character + 1)
+        # The parser puts an error found at the end of a line, such as a block
+        # with no body, at the end of that line, so the one-column range ends
+        # past it. Both ends are moved into the document, and such an error
+        # gets an empty range at the end of its line.
+        start = _position_in_document(document, start)
+        end = _position_in_document(document, end)
         return ((), (), _encode_range(SourceRange(start, end)))
 
     normalized_source = "\n".join(document.lines)

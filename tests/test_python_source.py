@@ -7,7 +7,7 @@ import pytest
 
 import pyinc.integrations as integrations
 from pyinc import Database
-from pyinc.integrations import SourcePosition, SourceRange
+from pyinc.integrations import DocumentMap, SourcePosition, SourceRange
 from pyinc.integrations.python_source import (
     DefinitionRef,
     DependencySurface,
@@ -231,6 +231,41 @@ def test_file_analysis_reports_syntax_errors(mode: str, tmp_path: Path) -> None:
     assert analysis.diagnostics[0].message
     assert analysis.diagnostics[0].range is not None
     assert analysis.diagnostics[0].range.start.line == 0
+
+
+# A file passes through these states while it is typed. The parser reports the
+# first four at the end of the line, and the range used to end one column past it.
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("x = 1\nif x:", _range(1, 5, 5)),
+        ("x = 1\ndef f():\n", _range(1, 8, 8)),
+        ("x = 1 +\n", _range(0, 7, 7)),
+        ("import os\nos.\n", _range(1, 3, 3)),
+        ("x = 1\nprint(", _range(1, 5, 6)),
+    ],
+    ids=[
+        "block-without-body",
+        "def-without-body",
+        "trailing-operator",
+        "trailing-dot",
+        "open-paren",
+    ],
+)
+def test_syntax_error_range_lies_inside_the_document(
+    text: str, expected: SourceRange, tmp_path: Path
+) -> None:
+    path = tmp_path / "typing.py"
+    path.write_bytes(text.encode("utf-8"))
+
+    [diagnostic] = file_analysis(Database(mode="strict"), path).diagnostics
+
+    assert diagnostic.code == "syntax-error"
+    assert diagnostic.range == expected
+    lines = DocumentMap(text).lines
+    for position in (expected.start, expected.end):
+        assert position.line < len(lines)
+        assert position.character <= len(lines[position.line])
 
 
 # The unary chain overflows the parser's own stack, and ast.parse raises

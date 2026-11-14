@@ -929,31 +929,77 @@ class LanguageServer:
                 if self._published_signatures.get(path) == signature:
                     continue
                 try:
-                    sent = self._send_notification(
-                        "textDocument/publishDiagnostics",
-                        {
-                            "uri": _path_to_uri(path),
-                            "diagnostics": diagnostics,
-                        },
-                        session=session,
-                    )
+                    sent = self._send_file_diagnostics(path, diagnostics, session)
                 except InvalidParams:
-                    # Positions are converted against the live document text.
-                    # An edit made after the analysis can leave a range outside
-                    # that text. The path is skipped and left unrecorded, and
-                    # the publish that follows the edit sends the diagnostics
-                    # the edit produced.
+                    # An edit landed between the two reads of the document
+                    # text. The path is skipped and left unrecorded, and the
+                    # publish that follows the edit sends the diagnostics the
+                    # edit produced.
                     continue
-                if not sent:
+                if sent is None:
                     return
-                # Recorded only once the client has the notification, so the
-                # bookkeeping always describes what the client was sent.
-                if diagnostics:
-                    self._published_signatures[path] = signature
+                # Recorded from the diagnostics written, and only once the
+                # client has them, so the bookkeeping always describes what
+                # the client was sent.
+                if sent:
+                    self._published_signatures[path] = tuple(
+                        _diagnostic_signature(item) for item in sent
+                    )
                     self._published_paths.add(path)
                 else:
                     self._published_signatures.pop(path, None)
                     self._published_paths.discard(path)
+
+    def _send_file_diagnostics(
+        self, path: str, diagnostics: list[dict[str, Any]], session: WorkspaceSession
+    ) -> list[dict[str, Any]] | None:
+        """Publish one file's diagnostics and return the list written.
+
+        None means nothing was written. Positions are converted against the
+        live document text. An edit made after the analysis, or a range the
+        analysis got wrong, can leave a position outside that text. The text
+        is then read again. A line past the last moves to the end of the last
+        line, and a column past the end of its line moves to that end. The
+        caller records the moved list, so the publish that follows such an
+        edit compares its analysis with what the client holds and sends it
+        when they differ. InvalidParams means the text changed between the
+        two reads.
+        """
+
+        uri = _path_to_uri(path)
+        with contextlib.suppress(InvalidParams):
+            written = self._send_notification(
+                "textDocument/publishDiagnostics",
+                {"uri": uri, "diagnostics": diagnostics},
+                session=session,
+            )
+            return diagnostics if written else None
+        source = self._source_for_uri(uri)
+        if source is not None:
+            lines = DocumentMap(source).lines
+
+            def inside(position: dict[str, int]) -> dict[str, int]:
+                if position["line"] >= len(lines):
+                    return {"line": len(lines) - 1, "character": len(lines[-1])}
+                length = len(lines[position["line"]])
+                return {"line": position["line"], "character": min(position["character"], length)}
+
+            diagnostics = [
+                {
+                    **item,
+                    "range": {
+                        "start": inside(item["range"]["start"]),
+                        "end": inside(item["range"]["end"]),
+                    },
+                }
+                for item in diagnostics
+            ]
+        written = self._send_notification(
+            "textDocument/publishDiagnostics",
+            {"uri": uri, "diagnostics": diagnostics},
+            session=session,
+        )
+        return diagnostics if written else None
 
     def _document_diagnostic(self, params: Any) -> dict[str, Any]:
         document = params["textDocument"]

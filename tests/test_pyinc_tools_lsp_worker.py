@@ -16,14 +16,16 @@ import io
 import os
 import threading
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from pyinc.integrations import SourcePosition, SourceRange
 from pyinc_tools._jsonrpc import read_message
 from pyinc_tools.lsp import LanguageServer
-from pyinc_tools.session import PollingWorkspaceWatcher, WorkspaceSession
+from pyinc_tools.session import AnalysisDiagnostic, PollingWorkspaceWatcher, WorkspaceSession
 
 # Capabilities of a client that can pull diagnostics, for the document and the
 # workspace, and also accepts pushed ones.
@@ -564,3 +566,143 @@ def test_a_failed_publish_prints_its_traceback_and_the_worker_keeps_publishing(
     published = harness.published()
     assert [uri for uri, _messages in published] == [path.as_uri()]
     assert "'missing_1'" in published[0][1][0]
+
+
+def _publishes(harness: _WatchedServer, path: Path) -> list[list[dict[str, Any]]]:
+    """The diagnostics of each publish for ``path``, oldest first."""
+    return [
+        message["params"]["diagnostics"]
+        for message in harness.messages()
+        if message.get("method") == "textDocument/publishDiagnostics"
+        and message["params"]["uri"] == path.as_uri()
+    ]
+
+
+def test_a_block_left_open_at_the_end_of_the_file_publishes_its_syntax_error(
+    watched: tuple[_WatchedServer, Path],
+) -> None:
+    """The syntax error replaces the diagnostics the file had before the edit.
+
+    The parser reports a block with no body at the end of its line. Its range
+    ended one column past the line, so the server skipped the file's
+    notification and the client kept the missing import.
+    """
+
+    harness, root = watched
+    path = root / "app.py"
+    harness.open(path, "import missing_0\n")
+    harness.drain()
+    assert [item["code"] for item in _publishes(harness, path)[-1]] == ["missing-import"]
+
+    harness.change(path, "x = 1\nif x:")
+    harness.drain()
+
+    end_of_line = {"line": 1, "character": 5}
+    assert [(item["code"], item["range"]) for item in _publishes(harness, path)[-1]] == [
+        ("syntax-error", {"start": end_of_line, "end": end_of_line})
+    ]
+
+
+def test_a_range_past_the_end_of_the_document_is_published_inside_it(
+    watched: tuple[_WatchedServer, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness, root = watched
+    path = root / "app.py"
+    session = harness.server._session
+    assert session is not None
+    analyze = session.analyze_workspace
+    past_the_end = AnalysisDiagnostic(
+        path=str(path),
+        code="past-the-end",
+        message="a range the document does not hold",
+        severity="error",
+        source="pyinc",
+        range=SourceRange(SourcePosition(0, 40), SourcePosition(5, 2)),
+    )
+
+    def analysis_with_a_range_past_the_end() -> Any:
+        return replace(analyze(), diagnostics=(past_the_end,))
+
+    monkeypatch.setattr(session, "analyze_workspace", analysis_with_a_range_past_the_end)
+    harness.open(path, "value = 1\n")
+    harness.drain()
+
+    assert [(item["code"], item["range"]) for item in _publishes(harness, path)[-1]] == [
+        (
+            "past-the-end",
+            {"start": {"line": 0, "character": 9}, "end": {"line": 1, "character": 0}},
+        )
+    ]
+
+
+def test_a_range_that_fits_again_after_a_moved_publish_is_sent(
+    watched: tuple[_WatchedServer, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The server compares the next analysis with the range it sent.
+
+    The first publish moves the range to the start of the empty second line.
+    After the edit the same analysis range fits the text. The server used to
+    compare it with the range before the move, find no change and skip the
+    publish, so the client kept the moved range.
+    """
+
+    harness, root = watched
+    path = root / "app.py"
+    session = harness.server._session
+    assert session is not None
+    analyze = session.analyze_workspace
+    second_line = AnalysisDiagnostic(
+        path=str(path),
+        code="second-line",
+        message="a range on the second line",
+        severity="error",
+        source="pyinc",
+        range=SourceRange(SourcePosition(1, 0), SourcePosition(1, 16)),
+    )
+
+    def analysis_with_a_range_on_the_second_line() -> Any:
+        return replace(analyze(), diagnostics=(second_line,))
+
+    monkeypatch.setattr(session, "analyze_workspace", analysis_with_a_range_on_the_second_line)
+    harness.open(path, "value = 1\n")
+    harness.drain()
+    start_of_line = {"line": 1, "character": 0}
+    assert [item["range"] for item in _publishes(harness, path)[-1]] == [
+        {"start": start_of_line, "end": start_of_line}
+    ]
+
+    harness.change(path, "value = 1\nimport missing_0\n")
+    harness.drain()
+
+    assert [item["range"] for item in _publishes(harness, path)[-1]] == [
+        {"start": start_of_line, "end": {"line": 1, "character": 16}}
+    ]
+
+
+def test_a_publish_overtaken_by_an_edit_is_replaced_by_the_edits_publish(
+    watched: tuple[_WatchedServer, Path],
+) -> None:
+    """An analysis that ran before an edit is sent, and the edit's publish follows it.
+
+    The held analysis found the missing import on the second line. The edit
+    leaves that line empty, so the range is moved to its start. The analysis
+    of the edit finds nothing, and its publish clears the file.
+    """
+
+    harness, root = watched
+    path = root / "app.py"
+    held = harness.hold(holding_session_lock=False)
+    harness.open(path, "value = 1\nimport missing_0\n")
+    assert held.entered.wait(_TIMEOUT)
+    try:
+        harness.change(path, "value = 1\n")
+    finally:
+        held.release.set()
+    harness.drain()
+
+    start_of_line = {"line": 1, "character": 0}
+    publishes = _publishes(harness, path)
+    assert [[(item["code"], item["range"]) for item in items] for items in publishes] == [
+        [("missing-import", {"start": start_of_line, "end": start_of_line})],
+        [],
+    ]
