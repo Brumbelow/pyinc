@@ -521,6 +521,17 @@ def _refuse_broad_root(root: Path) -> None:
         )
 
 
+def _is_import_alias(binding: Any) -> bool:
+    """Whether ``binding`` is the name an ``import ... as`` gives its target."""
+
+    return (
+        binding is not None
+        and binding.kind == "from_import_alias"
+        and binding.import_source is not None
+        and binding.name != binding.import_source.rpartition(":")[2]
+    )
+
+
 def _is_number(value: object) -> bool:
     """Whether ``value`` is an int or float with a finite float value. A bool does not count."""
 
@@ -656,7 +667,7 @@ class LanguageServer:
             except InvalidParams as exc:
                 # Raised by the params checks, by the conversion of the client's
                 # positions, and where _uri_to_path or _initialize refuse the
-                # root the client named.
+                # root the client named or _initialize refuses a watcher option.
                 self._send_error(
                     request_id,
                     _JSONRPC_INVALID_PARAMS,
@@ -1554,10 +1565,15 @@ class LanguageServer:
             return None
         identifier, start_col, end_col = span
         try:
+            local_binding = session._local_binding_at(real_path, SourcePosition(line, character))
             target = session.symbol_at(real_path, SourcePosition(line, character))
         except FileNotFoundError:
             return None
         if target is None:
+            return None
+        # Rename refuses the alias of an `import ... as` and a use spelled
+        # with it, so there is nothing to prepare at either.
+        if _is_import_alias(local_binding) or identifier != target.name:
             return None
         return {
             "range": {
@@ -1586,12 +1602,7 @@ class LanguageServer:
             target = session.symbol_at(real_path, SourcePosition(line, character))
         except FileNotFoundError:
             return None
-        if (
-            local_binding is not None
-            and local_binding.kind == "from_import_alias"
-            and local_binding.import_source is not None
-            and local_binding.name != local_binding.import_source.rpartition(":")[2]
-        ):
+        if _is_import_alias(local_binding):
             raise _RequestFailed(
                 f"Cannot rename {identifier!r} via an `import ... as` alias; "
                 f"rename the original symbol instead."

@@ -229,7 +229,11 @@ Pass these keys under the LSP `initializationOptions` object:
 | `pyinc.workspace.maxFiles` | integer | `1000` | Refuses a workspace with more Python and manifest files than this. |
 
 A `pyinc.watcher.debounceMs` or `pyinc.watcher.intervalMs` of the wrong type
-fails initialize with an Invalid params error.
+fails initialize with an Invalid params error. `pyinc.watcher.enabled` is read
+as a truth value: `null`, `0` and an empty string turn the watcher off, and any
+other value turns it on. A `pyinc.workspace.maxFiles` that is not an integer of
+at least 1 keeps the default. A `pyinc.workspace.exclude` that is not an array
+is ignored, and so are its entries that are not strings.
 
 The built-in watcher and `workspace/didChangeWatchedFiles` can run together.
 The watcher skips a path whose disk content equals what the mirror last copied

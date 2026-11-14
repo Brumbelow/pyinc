@@ -2850,7 +2850,7 @@ def test_concurrent_response_and_watcher_notification_writes_keep_framing_parsea
             server._send({"jsonrpc": "2.0", "id": sequence, "result": {"writer": "loop"}})
 
     def send_notifications() -> None:
-        # The watcher callback's side: publishes on the polling thread.
+        # The diagnostics worker's side: publishes on its own thread.
         ready.wait(timeout=5.0)
         for sequence in range(message_count):
             server._send_notification("test/ping", {"writer": "watcher", "sequence": sequence})

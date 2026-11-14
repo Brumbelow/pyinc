@@ -303,3 +303,48 @@ def test_linked_editing_answers_null_for_a_use_spelled_with_an_alias(tmp_path: P
     assert replies[2]["result"] == {
         "ranges": [{"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 3}}]
     }
+
+
+def test_prepare_rename_answers_null_where_rename_refuses_an_alias(tmp_path: Path) -> None:
+    """A position that rename refuses has nothing to prepare.
+
+    `f` is an alias of `foo`. Rename refuses the alias on the import line and
+    a use spelled with it. prepareRename answers null at both, so a client
+    never opens a rename it cannot finish.
+    """
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.py").write_text("def foo() -> int:\n    return 1\n", encoding="utf-8")
+    consumer = root / "b.py"
+    consumer.write_text("from a import foo, foo as f\n\nfoo()\nf()\n", encoding="utf-8")
+    uri = consumer.as_uri()
+
+    def at(request_id: int, method: str, line: int, character: int) -> dict[str, Any]:
+        params = {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": character},
+            "newName": "renamed",
+        }
+        return _request(request_id, method, params)
+
+    status, replies = _serve(
+        [
+            _initialize(root),
+            at(1, "textDocument/prepareRename", 3, 0),
+            at(2, "textDocument/prepareRename", 0, 26),
+            at(3, "textDocument/prepareRename", 2, 1),
+            at(4, "textDocument/rename", 3, 0),
+            at(5, "textDocument/rename", 0, 26),
+        ]
+    )
+
+    assert status == 0
+    assert replies[1]["result"] is None
+    assert replies[2]["result"] is None
+    assert replies[3]["result"] == {
+        "range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 3}},
+        "placeholder": "foo",
+    }
+    assert replies[4]["error"]["code"] == -32803
+    assert replies[5]["error"]["code"] == -32803

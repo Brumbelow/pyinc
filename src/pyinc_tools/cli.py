@@ -50,7 +50,8 @@ def _non_negative_int(text: str) -> int:
 
 
 def _positive_int(text: str) -> int:
-    # A zero poll interval would make the watcher spin on the CPU.
+    # A zero poll interval would make the watcher spin on the CPU, and a file
+    # limit of zero would refuse every workspace.
     return _int_at_least(text, 1)
 
 
