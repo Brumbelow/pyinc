@@ -209,6 +209,9 @@ file is coarser than the file.
 Put the lossy projection in a query that *returns* the projection instead:
 
 ```python
+from __future__ import annotations
+
+
 @query
 def source_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)[0]

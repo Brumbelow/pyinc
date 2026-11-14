@@ -40,6 +40,8 @@ only to fix a defect.
 ## Quick start
 
 ```python docs-check
+from __future__ import annotations
+
 from pyinc import Database, Input, query
 
 NAMES = Input[tuple[str, ...]]("example.names")
@@ -68,11 +70,14 @@ node, so everything downstream stays valid.
 ![Editing pytest under pyinc's watcher](https://raw.githubusercontent.com/Brumbelow/pyinc/main/docs/assets/demo.gif)
 
 `pyinc-tools` was pointed at a pinned checkout of pytest, with nothing in it
-adapted for `pyinc`, and watched while single files were edited. In one
-recorded run it took 109.08 s to analyze all 270 files from cold, then 632 ms
-to catch up after an edit. Timings are machine-specific.
+adapted for `pyinc`, and watched while single files were edited. The recording
+was made with a development build of pyinc 3.1.
 [The demo page](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md) has
-the clips, the full provenance, and the deterministic work counts.
+the clips and their provenance. For numbers from your own machine, run
+`python -m bench.overhead` from the repository root. It prints cost ratios
+measured in one run. The
+[benchmark README](https://github.com/Brumbelow/pyinc/blob/main/bench/README.md)
+describes the harness.
 
 ## Documentation
 

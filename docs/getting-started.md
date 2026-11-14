@@ -19,6 +19,8 @@ An `Input` is a base value supplied by your application. Give it a stable,
 non-empty key. The key is its identity in a `Database` and in checkpoints.
 
 ```python docs-check
+from __future__ import annotations
+
 from pyinc import Database, Input, query
 
 SOURCE = Input[str]("guide.source")
@@ -42,6 +44,11 @@ db.set(SOURCE, "incremental work stays very focused")
 assert db.get(word_count) == 5
 ```
 
+The examples start with `from __future__ import annotations` because an
+evaluated `db: Database` annotation folds `pyinc/runtime.py` into the query's
+[identity](kernel-contract.md#3-deterministic-queries), so each warm `get`
+re-reads that file.
+
 Calling one query from another is ordinary Python. While `word_count` runs,
 the database records its dependency on `words`, and `words` records its
 dependency on `SOURCE`. `db.get(...)` is the top-level request boundary.
@@ -60,6 +67,8 @@ files, file metadata, environment variables, directory listings, and symlink-
 aware path resolution.
 
 ```python docs-check
+from __future__ import annotations
+
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -131,6 +140,8 @@ and starts no verification pass. Use `inspect_fresh()` when the inspection must
 first verify current inputs and resources.
 
 ```python docs-check
+from __future__ import annotations
+
 from pyinc import Database, Input, query
 
 NUMBER = Input[int]("guide.number")
@@ -174,6 +185,8 @@ separate top-level boundary that turns a complete desired `Output` set into
 files.
 
 ```python docs-check
+from __future__ import annotations
+
 from pathlib import Path
 from tempfile import TemporaryDirectory
 

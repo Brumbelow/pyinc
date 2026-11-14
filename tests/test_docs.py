@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         check_schema_versions,
         external_urls,
         markdown_files,
+        parse_fences,
         table_rows,
     )
 else:
@@ -33,6 +34,7 @@ else:
         check_schema_versions,
         external_urls,
         markdown_files,
+        parse_fences,
         table_rows,
     )
 
@@ -40,6 +42,40 @@ else:
 def test_documentation_checker_accepts_repository() -> None:
     errors = check_docs(PROJECT_ROOT)
     assert not errors, "\n".join(errors)
+
+
+def test_examples_that_annotate_database_start_with_the_future_import() -> None:
+    """An evaluated `db: Database` annotation folds pyinc/runtime.py into the query's identity.
+
+    Each warm get then re-reads that file. The examples a reader copies first
+    defer their annotations, so a copied query skips that read.
+    """
+    checked = 0
+    missing: list[str] = []
+    for name in ("README.md", "docs/getting-started.md", "docs/integration-authoring.md"):
+        fences, _ = parse_fences(PROJECT_ROOT / name)
+        for fence in fences:
+            if fence.info[:1] != ("python",):
+                continue
+            tree = ast.parse(fence.content)
+            if not any(
+                isinstance(node, ast.arg)
+                and isinstance(node.annotation, ast.Name)
+                and node.annotation.id == "Database"
+                for node in ast.walk(tree)
+            ):
+                continue
+            checked += 1
+            first = tree.body[0]
+            if not (
+                isinstance(first, ast.ImportFrom)
+                and first.module == "__future__"
+                and any(alias.name == "annotations" for alias in first.names)
+            ):
+                missing.append(f"{name}:{fence.line}")
+
+    assert checked, "expected examples that annotate a parameter with Database"
+    assert not missing, "examples without `from __future__ import annotations`: " + ", ".join(missing)
 
 
 def test_every_documentation_check_is_registered_with_the_composed_checker() -> None:

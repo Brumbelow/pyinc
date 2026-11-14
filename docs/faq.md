@@ -72,7 +72,8 @@ pyinc is for a result that depends on something the arguments do not name:
   receive an equal argument. What it lacks is the dynamic dependency graph and
   revision metadata. So nothing decides *without recomputing the chain* that
   dependents are still current, and nothing ever tells it to drop the stale
-  entries. The 52 backdated nodes in the [demo](demo.md) are that effect.
+  entries. The [demo](demo.md) shows that effect: the engine absorbs a
+  comment edit as backdates.
 - Ownership. `lru_cache` hands every caller the same object, so mutating a
   cached list corrupts every later hit. pyinc snapshots values at the
   boundary, which keeps cached state out of a caller's reach.
@@ -90,11 +91,6 @@ No per-query overhead figure is published, and this page will not invent one.
 
 What is published:
 
-- The [demo](demo.md) numbers. A 270-file pytest checkout was analyzed in
-  109.08 s from cold, then re-analyzed in 632 ms after a single-file edit,
-  executing 74 queries and reusing 9,722. The timings are one recorded run on
-  one machine. The counts were measured separately against the current build.
-  The demo page states the full provenance.
 - The [benchmark and correctness harness](../bench/README.md), which runs a
   fixed 67-row matrix comparing pyinc against fresh recomputation, an
   intentionally incomplete naive cache, and `joblib.Memory`.
