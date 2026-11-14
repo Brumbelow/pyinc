@@ -13,7 +13,7 @@ from pyinc.runtime import Database
 from pyinc.value import thaw
 
 from ._decoding import _reject_in_query
-from ._resources import file_probe, file_read_snapshot, file_text
+from ._resources import TextPayload, file_probe, text_payload, text_payload_snapshot
 
 ConfigKeyPayload: TypeAlias = tuple[str, str, str, str]
 ConfigSectionPayload: TypeAlias = tuple[str, tuple[ConfigKeyPayload, ...], tuple[str, ...]]
@@ -62,8 +62,8 @@ class ConfigAnalysis:
 class _ConfigFileResource:
     encoding: str = "utf-8"
 
-    def read(self, db: Database, path: str | os.PathLike[str]) -> str:
-        return cast(str, db.read_resource(self, os.fspath(path)))
+    def read(self, db: Database, path: str | os.PathLike[str]) -> TextPayload:
+        return cast(TextPayload, db.read_resource(self, os.fspath(path)))
 
     def label(self, path: str) -> str:
         return f"configfile[{path}]"
@@ -71,13 +71,13 @@ class _ConfigFileResource:
     def probe(self, path: str) -> tuple[str, str] | tuple[str]:
         return file_probe(path)
 
-    def load(self, db: Database, path: str) -> str:
-        text = file_text(path, self.encoding)
-        return text if text is not None else ""
+    def load(self, db: Database, path: str) -> TextPayload:
+        return text_payload(path, self.encoding)
 
-    def probe_and_load(self, db: Database, path: str) -> tuple[tuple[str, str] | tuple[str], str]:
-        probe, text = file_read_snapshot(path, self.encoding)
-        return probe, text if text is not None else ""
+    def probe_and_load(
+        self, db: Database, path: str
+    ) -> tuple[tuple[str, str] | tuple[str], TextPayload]:
+        return text_payload_snapshot(path, self.encoding)
 
 
 _FILES = _ConfigFileResource()
@@ -302,7 +302,7 @@ def _config_shape_diagnostics(parsed: dict[str, Any]) -> tuple[DiagnosticPayload
 
 @query
 def config_file_text(db: Database, path: str) -> str:
-    return _FILES.read(db, path)
+    return _FILES.read(db, path)[0]
 
 
 @query
@@ -358,6 +358,11 @@ def config_tool_configs_payload(db: Database, path: str) -> tuple[str, ...]:
 def config_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload, ...]:
     text = config_file_text(db, path)
     if not text:
+        # A file that does not decode reads as empty text, so only then is the
+        # error looked up.
+        decode_error = _FILES.read(db, path)[1]
+        if decode_error is not None:
+            return (("toml-decode-error", decode_error),)
         return ()
     try:
         parsed = _load_toml(text)

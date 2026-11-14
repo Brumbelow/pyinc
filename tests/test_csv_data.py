@@ -184,6 +184,28 @@ def test_csv_analysis_missing_file(mode: str, tmp_path: Path) -> None:
     assert result.diagnostics == ()
 
 
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_csv_analysis_reports_a_non_utf8_file(mode: str, tmp_path: Path) -> None:
+    path = tmp_path / "data.csv"
+    path.write_bytes(b"\xff\xfe\x00bad")
+    with pytest.raises(UnicodeDecodeError) as caught:
+        path.read_bytes().decode("utf-8")
+    db = Database(mode=mode)
+
+    assert csv_analysis(db, str(path)) == CsvAnalysis(
+        path=str(path),
+        columns=(),
+        row_count=0,
+        delimiter=",",
+        has_header=False,
+        diagnostics=(("csv-decode-error", f"{path}: {caught.value}"),),
+    )
+
+    # The read stays tracked, so the same database sees the file once it is fixed.
+    path.write_text(_MINIMAL_CSV, encoding="utf-8")
+    assert csv_analysis(db, str(path)) == csv_analysis(Database(mode=mode), str(path))
+
+
 # ---------------------------------------------------------------------------
 # Workspace discovery
 # ---------------------------------------------------------------------------

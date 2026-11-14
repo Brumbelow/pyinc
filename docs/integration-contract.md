@@ -11,6 +11,12 @@ values. High-level entrypoints decode cached tuple payloads into those records.
 The payload queries and decoding helpers in individual modules are outside
 this contract.
 
+The TOML, JSON, requirements, environment, XML, CSV and notebook integrations
+read their files as UTF-8. A file that does not decode gets the result an empty
+file gets, plus the decode diagnostic its table names. The message is the
+file's path, a colon, and the codec's error. No `UnicodeDecodeError` reaches
+the caller.
+
 Call a high-level entrypoint from outside a query. A query body that reaches
 one is refused, as the composition section below sets out. Several threads may
 call the entrypoints at once, on one `Database` or on several. The memo of
@@ -93,6 +99,7 @@ property of the caller's remaining stack and is no fault of the file.
 | Purpose | Inspect TOML sections and summarize Python project dependencies and tool tables. |
 | Entrypoints | `config_analysis`, `workspace_config_analysis` |
 | Result types | `ConfigAnalysis`, `ConfigKey`, `ConfigSection` |
+| Decode diagnostic | `toml-decode-error`, for a file that is not valid UTF-8 as for one that is not valid TOML. |
 
 ### Semantics
 
@@ -118,6 +125,7 @@ fixed text `TOML parsing exhausted the interpreter stack`.
 | Purpose | Inspect keys and nested sections in a JSON object. |
 | Entrypoints | `json_analysis`, `workspace_json_analysis` |
 | Result types | `JsonAnalysis`, `JsonKey`, `JsonSection` |
+| Decode diagnostic | `json-decode-error`, for a file that is not valid UTF-8 as for one that is not valid JSON. |
 
 ### Semantics
 
@@ -143,6 +151,7 @@ exhaustion that diagnostic carries the fixed text
 | Purpose | Parse requirements files and optionally follow their requirement-file includes. |
 | Entrypoints | `requirements_analysis`, `deep_requirements_analysis`, `workspace_requirements_analysis` |
 | Result types | `FileReference`, `IndexDirective`, `RequirementRef`, `RequirementsAnalysis` |
+| Decode diagnostic | `requirements-decode-error`, for a file that is not valid UTF-8. Deep analysis reports it for each such file it reaches. |
 
 ### Semantics
 
@@ -194,6 +203,7 @@ reported as ambiguous and never guessed.
 | Purpose | Parse `.env`-style assignments without applying them to the process environment. |
 | Entrypoints | `env_analysis`, `workspace_env_analysis` |
 | Result types | `EnvEntry`, `EnvFileAnalysis` |
+| Decode diagnostic | `env-decode-error`, for a file that is not valid UTF-8. |
 | Supported shapes | Single-line `KEY=VALUE`, optional `export`, quoted and unquoted values, comments, and braced `${NAME}` interpolation detection. Workspace discovery defaults to `.env`. |
 | Key limits | Interpolation is diagnosed but not evaluated. Bare `$NAME`, command substitution, multiline dotenv variants, shell execution, and writes are out of scope. |
 
@@ -204,6 +214,7 @@ reported as ambiguous and never guessed.
 | Purpose | Inspect XML elements, attributes, text, child tags, and dot-separated element paths. |
 | Entrypoints | `xml_analysis`, `workspace_xml_analysis` |
 | Result types | `XmlAnalysis`, `XmlAttribute`, `XmlElement` |
+| Decode diagnostic | `xml-decode-error`, for a file that is not valid UTF-8. The bytes are decoded as UTF-8 whatever encoding the XML declaration names. |
 
 ### Semantics
 
@@ -228,6 +239,7 @@ paths identify hierarchy but do not index repeated siblings.
 | Purpose | Summarize delimited table structure and inconsistent row widths. |
 | Entrypoints | `csv_analysis`, `workspace_csv_analysis` |
 | Result types | `CsvAnalysis`, `CsvColumn` |
+| Decode diagnostic | `csv-decode-error`, for a file that is not valid UTF-8. |
 | Supported shapes | CSV/TSV text handled by the stdlib CSV parser, delimiter/header sniffing, columns, row counts, and inconsistent-column diagnostics. Workspace discovery defaults to `data.csv`. |
 | Key limits | The complete file is read and parsed. Delimiter and header sniffing inspect only the first 8192 characters, so a file whose dialect or header shape shows only later may be misclassified. Line endings are translated before the dialect is sniffed. A sniffed delimiter that is a line terminator or the quote character is refused, and the text is read as comma-delimited. Text the fallback dialect also fails to read is reported as an empty table. Each step down is recorded as a `csv-dialect-error` diagnostic. Schema/type inference and a streaming result API are out of scope, and dialects the stdlib sniffer cannot identify carry no guarantee. |
 
@@ -295,6 +307,7 @@ all. A base in neither tuple was followed.
 | Purpose | Inspect Jupyter notebook metadata and source-bearing cells without executing them. |
 | Entrypoints | `notebook_analysis`, `workspace_notebook_analysis` |
 | Result types | `NotebookAnalysis`, `NotebookCell`, `NotebookDefinition`, `NotebookDiagnostic`, `NotebookImport` |
+| Decode diagnostic | `notebook-decode-error`, for a file that is not valid UTF-8 as for one that is not valid JSON. It has no cell index and no range. |
 
 ### Semantics
 

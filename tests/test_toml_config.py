@@ -568,6 +568,29 @@ def test_config_analysis_on_nonexistent_file(tmp_path: Path) -> None:
     assert result.diagnostics == ()
 
 
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_config_analysis_reports_a_non_utf8_file(mode: str, tmp_path: Path) -> None:
+    path = tmp_path / "pyproject.toml"
+    path.write_bytes(b"\xff\xfe\x00bad")
+    with pytest.raises(UnicodeDecodeError) as caught:
+        path.read_bytes().decode("utf-8")
+    db = Database(mode=mode)
+
+    # The text reads as empty, as a missing file's does, so the root section stays.
+    assert config_analysis(db, str(path)) == ConfigAnalysis(
+        path=str(path),
+        sections=(integrations.ConfigSection(name="<root>", keys=(), subsections=()),),
+        dependencies=(),
+        optional_dependency_groups=(),
+        tool_configs=(),
+        diagnostics=(("toml-decode-error", f"{path}: {caught.value}"),),
+    )
+
+    # The read stays tracked, so the same database sees the file once it is fixed.
+    path.write_text(_MINIMAL_TOML, encoding="utf-8")
+    assert config_analysis(db, str(path)) == config_analysis(Database(mode=mode), str(path))
+
+
 def test_workspace_config_analysis_returns_none_when_missing(tmp_path: Path) -> None:
     root = tmp_path / "empty"
     root.mkdir()

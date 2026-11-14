@@ -177,6 +177,25 @@ def test_env_analysis_missing_file(mode: str, tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_env_analysis_reports_a_non_utf8_file(mode: str, tmp_path: Path) -> None:
+    path = tmp_path / ".env"
+    path.write_bytes(b"\xff\xfe\x00bad")
+    with pytest.raises(UnicodeDecodeError) as caught:
+        path.read_bytes().decode("utf-8")
+    db = Database(mode=mode)
+
+    assert env_analysis(db, str(path)) == EnvFileAnalysis(
+        path=str(path),
+        entries=(),
+        diagnostics=(("env-decode-error", f"{path}: {caught.value}"),),
+    )
+
+    # The read stays tracked, so the same database sees the file once it is fixed.
+    path.write_text(_MINIMAL_ENV, encoding="utf-8")
+    assert env_analysis(db, str(path)) == env_analysis(Database(mode=mode), str(path))
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_env_analysis_source_ranges(mode: str, tmp_path: Path) -> None:
     path = tmp_path / ".env"
     path.write_text(_MINIMAL_ENV, encoding="utf-8")

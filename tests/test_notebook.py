@@ -440,6 +440,34 @@ def test_notebook_missing_file(tmp_path: Path) -> None:
     assert result.language is None
 
 
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_notebook_analysis_reports_a_non_utf8_file(mode: str, tmp_path: Path) -> None:
+    path = tmp_path / "nb.ipynb"
+    path.write_bytes(b"\xff\xfe\x00bad")
+    with pytest.raises(UnicodeDecodeError) as caught:
+        path.read_bytes().decode("utf-8")
+    db = Database(mode=mode)
+
+    assert notebook_analysis(db, str(path)) == NotebookAnalysis(
+        path=str(path),
+        kernel_name=None,
+        language=None,
+        cells=(),
+        diagnostics=(
+            NotebookDiagnostic(
+                code="notebook-decode-error",
+                message=f"{path}: {caught.value}",
+                cell_index=None,
+                range=None,
+            ),
+        ),
+    )
+
+    # The read stays tracked, so the same database sees the file once it is fixed.
+    _write_notebook(path, _notebook([{"cell_type": "code", "source": "import os\n"}]))
+    assert notebook_analysis(db, str(path)) == notebook_analysis(Database(mode=mode), str(path))
+
+
 def test_notebook_unknown_cell_type_is_preserved(tmp_path: Path) -> None:
     nb = _notebook([{"cell_type": "exotic", "source": "weird"}])
     path = tmp_path / "nb.ipynb"

@@ -15,7 +15,7 @@ from pyinc.runtime import Database
 from pyinc.value import thaw
 
 from ._decoding import _reject_in_query
-from ._resources import file_probe, file_read_snapshot, file_text
+from ._resources import TextPayload, file_probe, text_payload, text_payload_snapshot
 
 JsonKeyPayload: TypeAlias = tuple[str, str, str, str]
 JsonSectionPayload: TypeAlias = tuple[str, tuple[JsonKeyPayload, ...], tuple[str, ...]]
@@ -58,8 +58,8 @@ class JsonAnalysis:
 class _JsonFileResource:
     encoding: str = "utf-8"
 
-    def read(self, db: Database, path: str | os.PathLike[str]) -> str:
-        return cast(str, db.read_resource(self, os.fspath(path)))
+    def read(self, db: Database, path: str | os.PathLike[str]) -> TextPayload:
+        return cast(TextPayload, db.read_resource(self, os.fspath(path)))
 
     def label(self, path: str) -> str:
         return f"jsonfile[{path}]"
@@ -67,13 +67,13 @@ class _JsonFileResource:
     def probe(self, path: str) -> tuple[str, str] | tuple[str]:
         return file_probe(path)
 
-    def load(self, db: Database, path: str) -> str:
-        text = file_text(path, self.encoding)
-        return text if text is not None else ""
+    def load(self, db: Database, path: str) -> TextPayload:
+        return text_payload(path, self.encoding)
 
-    def probe_and_load(self, db: Database, path: str) -> tuple[tuple[str, str] | tuple[str], str]:
-        probe, text = file_read_snapshot(path, self.encoding)
-        return probe, text if text is not None else ""
+    def probe_and_load(
+        self, db: Database, path: str
+    ) -> tuple[tuple[str, str] | tuple[str], TextPayload]:
+        return text_payload_snapshot(path, self.encoding)
 
 
 _FILES = _JsonFileResource()
@@ -305,7 +305,7 @@ def _try_parse_json(text: str) -> dict[str, Any] | None:
 
 @query
 def json_file_text(db: Database, path: str) -> str:
-    return _FILES.read(db, path)
+    return _FILES.read(db, path)[0]
 
 
 @query
@@ -321,6 +321,11 @@ def json_sections_payload(db: Database, path: str) -> tuple[JsonSectionPayload, 
 def json_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload, ...]:
     text = json_file_text(db, path)
     if not text:
+        # A file that does not decode reads as empty text, so only then is the
+        # error looked up.
+        decode_error = _FILES.read(db, path)[1]
+        if decode_error is not None:
+            return (("json-decode-error", decode_error),)
         return ()
     try:
         _load_json(text)

@@ -163,6 +163,29 @@ def test_deep_requirements_reports_nul_reference_without_path_error(
     assert result.diagnostics == (("unparseable-line", "line 1: -r invalid\x00name.in"),)
 
 
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_requirements_analysis_reports_a_non_utf8_file(mode: str, tmp_path: Path) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_bytes(b"\xff\xfe\x00bad")
+    with pytest.raises(UnicodeDecodeError) as caught:
+        path.read_bytes().decode("utf-8")
+    db = Database(mode=mode)
+
+    assert requirements_analysis(db, str(path)) == RequirementsAnalysis(
+        path=str(path),
+        requirements=(),
+        file_references=(),
+        index_directives=(),
+        diagnostics=(("requirements-decode-error", f"{path}: {caught.value}"),),
+    )
+
+    # The read stays tracked, so the same database sees the file once it is fixed.
+    path.write_text(_MINIMAL_REQUIREMENTS, encoding="utf-8")
+    assert requirements_analysis(db, str(path)) == requirements_analysis(
+        Database(mode=mode), str(path)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Specific correctness
 # ---------------------------------------------------------------------------

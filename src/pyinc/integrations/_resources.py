@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+from typing import TypeAlias
 
 from pyinc.resources import _read_file, _reads_as_missing
 
@@ -69,4 +70,52 @@ def file_read_snapshot(path: str, encoding: str) -> tuple[FileProbe, str | None]
     return ("present", hashlib.sha256(raw).hexdigest()), raw.decode(encoding)
 
 
-__all__ = ["FileProbe", "file_bytes", "file_probe", "file_read_snapshot", "file_text"]
+TextPayload: TypeAlias = tuple[str, str | None]
+
+
+def text_payload(path: str, encoding: str) -> TextPayload:
+    """Read a text resource as ``(text, decode_error)``.
+
+    The text comes from ``file_text``, so its newline handling is unchanged. A
+    file whose bytes do not decode answers empty text and a message made of the
+    path and the codec's error, as ``python_source`` reports its source. The
+    query that owns the file turns the message into its own diagnostic, so an
+    undecodable file never raises out of an entrypoint. An absent file answers
+    empty text and no error.
+    """
+
+    try:
+        text = file_text(path, encoding)
+    except UnicodeDecodeError as exc:
+        return "", f"{path}: {exc}"
+    return (text if text is not None else ""), None
+
+
+def text_payload_snapshot(path: str, encoding: str) -> tuple[FileProbe, TextPayload]:
+    """Read a text resource once and derive its probe from those exact bytes.
+
+    The answer has the shape ``text_payload`` gives. The probe hashes the raw
+    bytes whether or not they decode, so an edit to an undecodable file is
+    still seen.
+    """
+
+    raw = file_bytes(path)
+    if raw is None:
+        return ("missing",), ("", None)
+    probe: FileProbe = ("present", hashlib.sha256(raw).hexdigest())
+    try:
+        return probe, (raw.decode(encoding), None)
+    except UnicodeDecodeError as exc:
+        return probe, ("", f"{path}: {exc}")
+
+
+__all__ = [
+    "FileProbe",
+    "TextPayload",
+    "file_bytes",
+    "file_probe",
+    "file_read_snapshot",
+    "file_text",
+    "text_payload",
+    "text_payload_snapshot",
+]

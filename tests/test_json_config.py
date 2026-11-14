@@ -496,6 +496,25 @@ def test_json_analysis_on_nonexistent_file(tmp_path: Path) -> None:
     assert result.diagnostics == ()
 
 
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_json_analysis_reports_a_non_utf8_file(mode: str, tmp_path: Path) -> None:
+    path = tmp_path / "package.json"
+    path.write_bytes(b"\xff\xfe\x00bad")
+    with pytest.raises(UnicodeDecodeError) as caught:
+        path.read_bytes().decode("utf-8")
+    db = Database(mode=mode)
+
+    assert json_analysis(db, str(path)) == JsonAnalysis(
+        path=str(path),
+        sections=(),
+        diagnostics=(("json-decode-error", f"{path}: {caught.value}"),),
+    )
+
+    # The read stays tracked, so the same database sees the file once it is fixed.
+    path.write_text(_MINIMAL_JSON, encoding="utf-8")
+    assert json_analysis(db, str(path)) == json_analysis(Database(mode=mode), str(path))
+
+
 def test_workspace_json_analysis_returns_none_when_missing(tmp_path: Path) -> None:
     root = tmp_path / "empty"
     root.mkdir()
