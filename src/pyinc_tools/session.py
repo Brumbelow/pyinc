@@ -792,6 +792,15 @@ class WorkspaceSession:
     ) -> list[CodeAction]:
         if not isinstance(node, ast.ImportFrom):
             return []
+        from_module = "." * node.level + (node.module or "")
+        target_paths = {
+            item.imported_name: item.resolved_path
+            for item in module_analysis(self.db, self.mirror_root, mirror_path).resolved_imports
+            if item.kind == "from"
+            and item.module == from_module
+            and item.range.start.line == node.lineno - 1
+            and item.resolution == "workspace"
+        }
         actions: list[CodeAction] = []
         for i, alias in enumerate(node.names):
             if alias.name == "*":
@@ -800,6 +809,10 @@ class WorkspaceSession:
             binding = alias.asname or alias.name
             resolved = _resolve_target(self.db, self.mirror_root, mirror_path, binding)
             if resolved.resolution != "missing":
+                continue
+            # A name the module may bind gets no diagnostic, so its import stays.
+            target_path = target_paths.get(alias.name)
+            if target_path is not None and self._module_may_bind(target_path, alias.name):
                 continue
             removal = self._alias_removal_edits(importer_path, source, node, i)
             if removal:
@@ -3677,6 +3690,14 @@ class WorkspaceSession:
                     _resolve_target(self.db, self.mirror_root, mirror_path, binding)
                 )
                 if symbol_result.resolution == "missing":
+                    # Resolution reads plain top-level statements only. A
+                    # module that binds the name some other way is not wrong.
+                    target_path = resolved_import.resolved_path
+                    if target_path is not None and self._module_may_bind(
+                        str(self._mirror_path_for_real(target_path)),
+                        resolved_import.imported_name,
+                    ):
+                        continue
                     diagnostics.append(
                         AnalysisDiagnostic(
                             path=real_path,
@@ -3710,6 +3731,31 @@ class WorkspaceSession:
         )
 
         return tuple(diagnostics)
+
+    def _module_may_bind(self, mirror_path: str, name: str) -> bool:
+        """Whether the module at ``mirror_path`` shows any sign of binding ``name``.
+
+        Symbol resolution reads plain top-level statements only. A module also
+        binds a name at module scope under ``if``, ``try``, ``with`` or ``for``,
+        through a walrus, through a star import of a module outside the
+        workspace, or on demand through a module-level ``__getattr__``. Any of
+        these means ``from <module> import name`` can work. Both reads are
+        made once per request, so a module many files import is read once.
+        """
+        lexical = scope_tree(self.db, mirror_path)
+        module_scopes = {scope.id for scope in lexical.scopes if scope.parent_id is None}
+        if any(
+            binding.scope_id in module_scopes and binding.name in (name, "__getattr__")
+            for binding in lexical.bindings
+        ):
+            return True
+        # The scope tree records no star import. Symbol resolution follows a
+        # star import of a workspace module. A star import of any other module
+        # binds names this analysis cannot list.
+        return any(
+            imported.imported_name == "*" and imported.resolution != "workspace"
+            for imported in module_analysis(self.db, self.mirror_root, mirror_path).resolved_imports
+        )
 
     def _unused_import_diagnostics(
         self,
@@ -3805,9 +3851,11 @@ class WorkspaceSession:
                 if binding in static_all:
                     continue
                 resolved = _resolve_target(self.db, self.mirror_root, mirror_path, binding)
-                # A binding that fails to resolve to a workspace symbol is a
-                # *broken* import with its own `unresolved-symbol` diagnostic.
-                # Leave it to that diagnostic and its quick fix.
+                # Only a binding that resolves to a workspace symbol gets an
+                # unused-import hint. The rest include a broken import, which
+                # has its own `unresolved-symbol` diagnostic and quick fix, a
+                # name its module binds outside plain statements, and a name
+                # the module takes from outside the workspace.
                 if resolved.resolution != "workspace":
                     continue
                 # A binding the scope tree does not place counts as used.

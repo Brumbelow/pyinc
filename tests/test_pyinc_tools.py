@@ -10006,3 +10006,105 @@ def test_requirements_path_and_url_lines_are_not_checked_as_dependencies(
     ] == [
         ("requirements.txt", "dependency-missing", 3, "Declared dependency 'pkg' is not installed.")
     ]
+
+
+@pytest.mark.parametrize(
+    ("provider", "name"),
+    [
+        (
+            'import sys\n\nif sys.platform == "win32":\n    SEP = "\\\\"\nelse:\n    SEP = "/"\n',
+            "SEP",
+        ),
+        ("try:\n    LIMIT = int('7')\nexcept ValueError:\n    LIMIT = 0\n", "LIMIT"),
+        ("import contextlib\n\nwith contextlib.nullcontext(7) as LIMIT:\n    pass\n", "LIMIT"),
+        ("for VALUE in range(3):\n    pass\n", "VALUE"),
+        ("(LIMIT := 7)\n", "LIMIT"),
+        ("from os.path import *\n", "join"),
+        ("def __getattr__(name: str) -> int:\n    return 1\n", "VALUE"),
+    ],
+    ids=["if-else", "try-except", "with-as", "for-loop", "walrus", "external-star", "getattr"],
+)
+def test_import_of_a_name_bound_outside_plain_statements_is_not_unresolved(
+    tmp_path: Path, provider: str, name: str
+) -> None:
+    # Symbol resolution reads plain top-level statements only. Each provider
+    # still lets `m` supply the name, through a module-scope binding, a star
+    # import or a module-level `__getattr__`, so the import works.
+    root = tmp_path / "workspace"
+    _write(root / "m.py", provider)
+    src = f"from m import {name}\n\nprint({name})\n"
+    _write(root / "c.py", src)
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "c.py")
+        actions = session.code_actions_for_range(root / "c.py", 0, 0, 0, 0)
+
+    assert [(d.code, d.message) for d in result.diagnostics] == []
+    assert actions == ()
+
+
+def test_import_of_a_name_the_module_never_binds_is_still_unresolved(tmp_path: Path) -> None:
+    # `NOPE` is bound only inside a function, and the star import names a
+    # workspace module that lacks it. Neither binds it in `m`.
+    root = tmp_path / "workspace"
+    _write(root / "helper.py", "def other() -> int:\n    return 1\n")
+    _write(
+        root / "m.py",
+        "import sys\n\nfrom helper import *\n\nif sys.platform == 'win32':\n    SEP = 'x'\n"
+        "else:\n    SEP = '/'\n\n\ndef f() -> None:\n    NOPE = 1\n",
+    )
+    src = "from m import SEP, NOPE\n\nprint(SEP, NOPE)\n"
+    _write(root / "c.py", src)
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "c.py")
+        actions = session.code_actions_for_range(root / "c.py", 0, 0, 0, 0)
+
+    assert [(d.code, d.message) for d in result.diagnostics] == [
+        ("unresolved-symbol", "Imported name 'NOPE' could not be resolved from 'm'.")
+    ]
+    assert [action.title for action in actions] == ["Remove import of 'NOPE'"]
+    assert (
+        _apply_code_action_edits(src, actions[0].edits) == "from m import SEP\n\nprint(SEP, NOPE)\n"
+    )
+
+
+def test_submodule_and_alias_imports_keep_their_diagnostics(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "pkg" / "__init__.py", "")
+    _write(root / "pkg" / "sub.py", "def f() -> int:\n    return 1\n")
+    _write(root / "pkg" / "used.py", "from . import sub\n\nsub.f()\n")
+    _write(root / "pkg" / "unused.py", "from . import sub\n\nx = 1\n")
+    _write(
+        root / "m.py",
+        "import sys\n\nif sys.platform == 'win32':\n    SEP = 'x'\nelse:\n    SEP = '/'\n",
+    )
+    _write(root / "alias.py", "from m import SEP as _sep\n\nprint(_sep)\n")
+    broken = "from m import SEP as _sep, nope\n\nprint(_sep)\n"
+    _write(root / "broken.py", broken)
+
+    with WorkspaceSession(root) as session:
+        used = session.analyze_file(root / "pkg" / "used.py")
+        used_actions = session.code_actions_for_range(root / "pkg" / "used.py", 0, 0, 0, 0)
+        unused = session.analyze_file(root / "pkg" / "unused.py")
+        alias = session.analyze_file(root / "alias.py")
+        alias_actions = session.code_actions_for_range(root / "alias.py", 0, 0, 0, 0)
+        broken_result = session.analyze_file(root / "broken.py")
+        broken_actions = session.code_actions_for_range(root / "broken.py", 0, 0, 0, 0)
+
+    assert [d.code for d in used.diagnostics] == []
+    assert used_actions == ()
+    assert [(d.code, d.message) for d in unused.diagnostics] == [
+        ("unused-import", "Imported name 'sub' is not used in this module.")
+    ]
+    # The source name `SEP` is what `m` has to bind. The alias `_sep` is not.
+    assert [d.code for d in alias.diagnostics] == []
+    assert alias_actions == ()
+    assert [(d.code, d.message) for d in broken_result.diagnostics] == [
+        ("unresolved-symbol", "Imported name 'nope' could not be resolved from 'm'.")
+    ]
+    assert [action.title for action in broken_actions] == ["Remove import of 'nope'"]
+    assert (
+        _apply_code_action_edits(broken, broken_actions[0].edits)
+        == "from m import SEP as _sep\n\nprint(_sep)\n"
+    )
