@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from pyinc import Database, InMemoryArtifactStore
+from pyinc import Database, InMemoryArtifactStore, query, runtime
 from pyinc.integrations import _decoding
 
 posix_fork = pytest.mark.skipif(not hasattr(os, "fork"), reason="os.fork does not exist here")
@@ -116,6 +116,31 @@ def test_a_forked_child_uses_a_store_while_another_thread_held_its_lock(operatio
 
     with _held_by_another_thread(store._process_lock()):
         exit_code = _exit_code_of_child(use_store)
+
+    assert exit_code == 0
+
+
+@query
+def _answer(db: Database) -> int:
+    return 1
+
+
+@posix_fork
+@fork_with_threads
+def test_a_forked_child_guards_again_while_another_thread_held_the_guard_lock() -> None:
+    assert Database().get(_answer) == 1
+    # The standard-library function the guard wrapped under this name.
+    original = runtime._GUARDED_NAMES[id(os.getcwd)].original
+
+    def guard_again() -> None:
+        # The end of a patch puts the original back, and the next query wraps
+        # it again under the guard's lock.
+        os.getcwd = original
+        assert Database().get(_answer) == 1
+        assert os.getcwd is not original
+
+    with _held_by_another_thread(runtime._GUARD_INSTALL_LOCK):
+        exit_code = _exit_code_of_child(guard_again)
 
     assert exit_code == 0
 

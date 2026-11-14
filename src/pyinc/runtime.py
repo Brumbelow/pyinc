@@ -1047,6 +1047,23 @@ _GUARD_INSTALLED = False
 _GUARD_INSTALL_LOCK = threading.Lock()
 
 
+def _new_guard_install_lock_in_child() -> None:
+    """Give a forked child a lock of its own for installing the guard.
+
+    A thread that held the lock when another thread forked does not exist in
+    the child, so the child would wait on the lock forever: at its first
+    `Database` if the guard was not yet in, or at the next query that wraps a
+    name again.
+    """
+
+    global _GUARD_INSTALL_LOCK
+    _GUARD_INSTALL_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_new_guard_install_lock_in_child)
+
+
 @dataclass(frozen=True)
 class _GuardedName:
     """A standard-library callable the guard replaced, and the wrapper it installed.
