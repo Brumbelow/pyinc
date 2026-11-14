@@ -65,13 +65,14 @@ configuration are in the [`pyinc-tools` guide](pyinc-tools-guide.md).
 ## Delivery and errors
 
 One worker thread runs the analyses whose diagnostics are pushed, and sends
-them.
-`initialized`, open, change, save, close, `workspace/didChangeWatchedFiles`,
-and each built-in watcher refresh schedule an analysis on it. Edits that
-arrive while an analysis runs are analyzed together when it ends, so
-diagnostics follow a pause in typing by one analysis. An analysis holds the
-session, so a request can wait for one running analysis to end. `shutdown`
-is answered without waiting.
+them. `initialized`, open, change, save, close,
+`workspace/didChangeWatchedFiles`, and each built-in watcher refresh schedule
+an analysis on it. A `didChange` that repeats the document's last open or
+change text schedules none, unless the document was saved or closed since.
+Edits that arrive while an analysis runs are analyzed together when it ends,
+so diagnostics follow a pause in typing by one analysis. An analysis holds the
+session, so a request can wait for one running analysis to end. `shutdown` is
+answered without waiting.
 
 The server sends no requests to the client. It reports no progress, reads no
 configuration after `initialize`, and does not cancel work on
@@ -90,9 +91,11 @@ configuration after `initialize`, and does not cancel work on
 `initialize` fails with `-32803` RequestFailed when the root is the home
 directory or a filesystem root, or when the workspace holds more Python and
 manifest files than the limit. A root that is not an existing directory, or a
-watcher option of the wrong type, fails it with `-32602` Invalid params. The
-guide's [initialization options](pyinc-tools-guide.md#initialization-options)
-set the exclusions and the file limit.
+workspace that holds a link to a target outside the root, fails it with
+`-32602` Invalid params. The guide's
+[initialization options](pyinc-tools-guide.md#initialization-options) set the
+exclusions and the file limit, and name the watcher values that fail it the
+same way.
 
 ## Analysis boundary
 
@@ -112,26 +115,15 @@ standard library.
 
 ## Diagnostics
 
-Workspace diagnostics combine the public integration results. The editor can
-receive, among others:
+Workspace diagnostics combine the public integration results. The guide's
+[diagnostic code table](pyinc-tools-guide.md#diagnostic-codes) lists each code
+with its severity, source, and meaning, and says when `undeclared-import` and
+`unused-import` are reported.
 
-- Python syntax and source-analysis diagnostics;
-- missing or ambiguous workspace imports;
-- undeclared or version-mismatched dependencies;
-- unused workspace `from ... import ...` bindings; and
-- diagnostics from the root Python project configuration and requirements
-  chain when those files participate in dependency analysis.
-
-The guide's [diagnostic code table](pyinc-tools-guide.md#diagnostic-codes)
-lists each code with its severity and source. `undeclared-import` is
-published only when the root holds a dependency manifest.
-
-Unused-import reporting is narrow by design. It skips package initializer
-files, star imports, installed and stdlib imports, and bindings that are
-visibly re-exported. Any read that resolves to the module-level binding
-counts as a use, including an attribute receiver such as `submodule.attr` and
-a name inside a string annotation. A function's own local of the same name
-does not count.
+For `unused-import`, any read that resolves to the module-level binding counts
+as a use, including an attribute receiver such as `submodule.attr` and a name
+inside a string annotation. A function's own local of the same name does not
+count.
 
 ## File-operation edits
 

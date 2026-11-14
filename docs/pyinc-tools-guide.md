@@ -140,9 +140,9 @@ table. A `[project]` table with `dynamic = ["dependencies"]` and no
 `requirements.txt` lists no dependencies, so each installed import gets the
 diagnostic unless an optional dependency group names it. `unused-import`
 checks only `from` imports of workspace modules, and never in an `__init__.py`
-file. It skips a file that does not parse, a `from m import x as x`
-re-export, a name in the module's `__all__`, and a name another workspace
-module imports from it.
+file. It skips a file that does not parse, a star import, a
+`from m import x as x` re-export, a name in the module's `__all__`, and a name
+another workspace module imports from it.
 
 ### Watch mode
 
@@ -162,8 +162,8 @@ library and is portable.
 
 Each poll walks the workspace and reads a file again only when its size or
 modification time changes, so an edit that keeps both is not seen. A path
-whose content on disk equals what the mirror holds is not reported, such as a
-file edited and then restored within the debounce window.
+whose content on disk equals what the mirror last copied from disk is not
+reported, such as a file edited and then restored within the debounce window.
 
 With `--format text`, each batch starts with a `# changed: <paths>` header,
 followed by that run's diagnostic lines. `grep -v '^#'` filters out the
@@ -212,16 +212,9 @@ home directory or a filesystem root, and when the workspace holds more than
 1,000 Python and manifest files. Exclude directories with
 `pyinc.workspace.exclude`, or raise the limit with `pyinc.workspace.maxFiles`.
 
-The server negotiates UTF-8, UTF-16, or UTF-32 positions and uses full-text
-document synchronization. It pushes diagnostics. One worker thread analyzes
-the workspace and publishes after `initialized`, open, change, save, close,
-and each built-in watcher refresh. A change that repeats the last text sent
-runs no analysis. Edits that arrive while an analysis runs are analyzed
-together in one run when it ends. A
-`workspace/didChangeWatchedFiles` notification analyzes and publishes on the
-request thread, before the server reads the next message. The
-[LSP reference](lsp-reference.md) has the complete method matrix and
-user-visible limitations.
+The server pushes diagnostics. The [LSP reference](lsp-reference.md) has the
+position and document model, the complete method matrix, when diagnostics are
+published, and the user-visible limitations.
 
 ### Initialization options
 
@@ -245,8 +238,7 @@ editor text is in the mirror (after `didOpen` or `didChange`, until `didSave`
 or `didClose`) is analyzed twice, because the editor's report leaves that text
 in place and the watcher still sees the disk change. A
 `workspace/didChangeWatchedFiles` notification always runs an analysis, so a
-change the watcher reports first is analyzed twice. Diagnostics equal to the
-last ones sent for a file are not sent again.
+change the watcher reports first is analyzed twice.
 
 ## Editor setup
 

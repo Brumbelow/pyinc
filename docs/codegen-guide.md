@@ -12,8 +12,8 @@ It is stdlib-only and uses only public `pyinc` names (`@query`,
 `pyinc_codegen`, outside the kernel. See the [package map](README.md#packages).
 
 `pyinc_codegen` is **feature-frozen**: its behavior changes only to fix a
-defect. It is outside the semantic-versioning promise.
-Its exported names and generated-output shape may change in any release.
+defect. It is outside the semantic-versioning promise, so a defect fix can
+change an exported name or the generated output in a minor or patch release.
 [SECURITY.md](../SECURITY.md) states what the promise covers.
 
 ## Usage
@@ -44,8 +44,7 @@ you call `generate_outputs.reconcile(...)` directly.
 ## Public surface
 
 `pyinc_codegen` exports the names below and only those. The grouping is
-editorial and may change in a later release. The export list is the union of
-all rows.
+editorial. The export list is the union of all rows.
 
 | Group | Names |
 |---|---|
