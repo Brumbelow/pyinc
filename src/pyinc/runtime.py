@@ -867,6 +867,9 @@ class _RequestScope:
     # Resource nodes whose failure record holds this request's exception, so
     # the scope can drop it (and the frames it pins) on the way out.
     failures: list[NodeKey] = field(default_factory=list)
+    # Each resource's identity digest, read once for this request however many
+    # memo guards check it. Keyed by id, with the resource kept beside it.
+    resource_digests: dict[int, tuple[Any, str]] = field(default_factory=dict)
     # Set on the request a `request_span` opened, with the span epoch it last
     # caught up to.
     span: bool = False
@@ -2022,13 +2025,6 @@ class Database:
         self._module_source_reads: ContextVar[_ModuleSourceReads | None] = ContextVar(
             "pyinc_module_source_reads", default=None
         )
-        # Plain instance state, unlike the ContextVar request slots beside it,
-        # on purpose. The only cross-thread effect is one request replacing
-        # another's cache. That costs the loser fresh reads and never hands
-        # anyone a digest from a request that has already ended. Degrading
-        # toward re-reading is the safe direction, so the simpler container
-        # opens no staleness class.
-        self._request_resource_digests: dict[int, tuple[Any, str]] | None = None
         self._fingerprint_cacheable: ContextVar[bool] = ContextVar(
             "pyinc_fingerprint_cacheable", default=True
         )
@@ -2566,7 +2562,8 @@ class Database:
         self._span_epoch += 1
         # A declared change is the only thing that may move a resource's
         # configuration inside a request, so the once-per-request digests are
-        # cleared with it and the span's next read re-reads.
+        # cleared with it and the span's next read re-reads. These are this
+        # thread's. A span on another thread clears its own when it syncs.
         if self._request_resource_digests is not None:
             self._request_resource_digests.clear()
         self._sync_span_to_epoch()
@@ -2589,6 +2586,7 @@ class Database:
         self._request_counter += 1
         request.request_id = self._request_counter
         request.span_epoch_seen = self._span_epoch
+        request.resource_digests.clear()
 
     def observe(
         self,
@@ -9862,16 +9860,13 @@ class Database:
         self._request_counter += 1
         request = _RequestScope(request_id=self._request_counter)
         token = self._request.set(request)
-        # Lives for this request only, so a resource's configuration is
-        # re-read once per request, however many memo guards check it.
-        self._request_resource_digests = {}
         try:
             yield request.pending_events
         finally:
             # First, so a context copied from this one stops joining it before
             # anything else the request owned is released.
             request.ended = True
-            self._request_resource_digests = None
+            request.resource_digests.clear()
             self._release_failure_exceptions(request.failures)
             # A context copied while the request was open still holds it, for
             # as long as its thread lives. These lists go unread once the
@@ -9901,6 +9896,17 @@ class Database:
         if request is None or request.ended or request.owner is not _current_thread_token():
             return None
         return request
+
+    @property
+    def _request_resource_digests(self) -> dict[int, tuple[Any, str]] | None:
+        """The resource digests this thread's open request has kept, if any.
+
+        They live on the request, so a span on one thread never answers for a
+        call on another. A call outside a request, such as `observe`, has none
+        and reads every resource afresh.
+        """
+        request = self._live_request()
+        return None if request is None else request.resource_digests
 
     def _mark_query_used(self, key: NodeKey) -> None:
         self._query_touch_counter += 1

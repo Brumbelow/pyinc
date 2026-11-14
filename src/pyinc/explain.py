@@ -129,7 +129,6 @@ def _classify_capture(
 
     type_name = type(value).__qualname__
     database = Database()
-    kind = "value"
     owner_function = owner if owner is not None else cast(FunctionType, _unbound_capture_owner)
     # The query function is being folded while its captures are.
     seen_functions = {id(owner)} if owner is not None else set()
