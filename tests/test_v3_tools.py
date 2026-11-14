@@ -470,12 +470,14 @@ def test_workspace_mirror_follows_recursive_requirement_files(tmp_path: Path) ->
 
     assert inputs.requirements is not None
     assert inputs.requirements.diagnostics == ()
+    # An entry is built from the parsed requirement, whose name carries
+    # underscores.
     assert set(inputs.declared_dependencies) >= {
-        "audit-base>=2",
-        "audit-lock==3",
-        "audit-final~=4",
+        "audit_base>=2",
+        "audit_lock==3",
+        "audit_final~=4",
     }
-    assert "constraint-only==1" not in inputs.declared_dependencies
+    assert "constraint_only==1" not in inputs.declared_dependencies
 
 
 def test_workspace_mirror_preserves_nul_reference_diagnostic(tmp_path: Path) -> None:
@@ -1089,8 +1091,8 @@ def test_watcher_detects_same_stat_recursive_requirement_change(
         assert watcher.poll() == (str(referenced.resolve()),)
         inputs = session._dependency_inputs()
 
-    assert "audit-two==2" in inputs.declared_dependencies
-    assert "audit-one==1" not in inputs.declared_dependencies
+    assert "audit_two==2" in inputs.declared_dependencies
+    assert "audit_one==1" not in inputs.declared_dependencies
 
 
 def test_thousand_module_workspace_has_bounded_incremental_work(
