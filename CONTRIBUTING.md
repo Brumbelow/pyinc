@@ -30,8 +30,9 @@ one file or one test, name its path or its node id, as in
 A pull request runs 21 CI jobs. The suite runs in four shards on each of Ubuntu
 3.11, Ubuntu 3.14, Windows 3.14 and macOS 3.14. The strict property tests run in
 three shards. One job runs the static checks and `pytest -m process`. One runs
-the shipped examples against the built wheel. A release tag runs the suite on
-3.11 to 3.14 and the free-threaded 3.14t on all three systems.
+the shipped examples against the built wheel. A run takes about 17 minutes. A
+release tag runs the suite on 3.11 to 3.14 and the free-threaded 3.14t on all
+three systems.
 
 ## Package boundaries
 
