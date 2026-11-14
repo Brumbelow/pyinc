@@ -781,7 +781,9 @@ class PollingWorkspaceWatcher:
         self._snapshot = current_snapshot
         if ready:
             try:
-                self._session.refresh_paths(list(ready))
+                ready = self._paths_the_mirror_lacks(ready, current_snapshot)
+                if ready:
+                    self._session.refresh_paths(list(ready))
             except Exception:
                 # The snapshot already matches disk, so nothing would re-detect
                 # these paths. Requeue them (original timestamps, already past
@@ -789,6 +791,25 @@ class PollingWorkspaceWatcher:
                 self._pending.update(in_flight)
                 raise
         return ready
+
+    def _paths_the_mirror_lacks(
+        self, paths: tuple[str, ...], snapshot: dict[str, str]
+    ) -> tuple[str, ...]:
+        """The paths whose disk content differs from what the mirror holds.
+
+        A save clears the overlay, which syncs the file from disk before this
+        poll sees its new hash. Refreshing it again syncs nothing and runs a
+        second analysis for the same save. So a path whose disk hash equals
+        the hash the mirror was synced from is dropped. A deleted path the
+        mirror no longer holds is dropped too. A driver without a mirror gets
+        every path.
+        """
+
+        mirrored = getattr(self._session, "_mirrored_content_hashes", None)
+        if mirrored is None:
+            return paths
+        hashes: dict[str, str] = mirrored()
+        return tuple(path for path in paths if hashes.get(path) != snapshot.get(path))
 
     def start(
         self,
