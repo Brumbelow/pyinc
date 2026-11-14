@@ -230,7 +230,12 @@ rejected the same way, and the diagnostic names that limit. Depth counts the
 document's root element as the first level. On stack exhaustion the diagnostic
 carries the fixed text `XML parsing exhausted the interpreter stack`. DTD/XSD validation, external
 entities, XInclude, streaming APIs, and general XPath are unsupported. Dot
-paths identify hierarchy but do not index repeated siblings.
+paths identify hierarchy but do not index repeated siblings. An XML
+declaration that names an encoding expat cannot use raises out of the
+entrypoint. A name Python does not know as a text encoding raises
+`LookupError`. A multi-byte encoding such as Shift_JIS, GB2312 or UTF-32
+raises `ValueError`. The `idna` and `undefined` codecs raise `UnicodeError`, a
+subclass of `ValueError`.
 
 ## CSV data
 
@@ -347,6 +352,10 @@ and the kernel metadata. Cell outputs and per-execution metadata never reach
 the parsed payloads, so they are not scanned. A notebook whose outputs
 contain a lone surrogate stays fully analyzable. A notebook whose sources
 contain one is reported as a decode error and gets no partial analysis.
+
+JSON nested deeper than the interpreter stack allows, about 1,000 levels on
+3.11, raises `RecursionError` out of the entrypoint. An integer of more than
+4,300 digits anywhere in the notebook raises `ValueError` out of it.
 
 ## Request scoping
 
