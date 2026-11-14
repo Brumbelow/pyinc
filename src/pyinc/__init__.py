@@ -1,3 +1,11 @@
+"""The pyinc incremental query kernel.
+
+The package exports `Database`, `Input`, `@query`, `Resource` and the built-in
+resources, `freeze`, `thaw` and the snapshot types, the inspection and observer
+types, the artifact stores, the `@action` output layer and the errors.
+`docs/kernel-contract.md` states the guarantee and the conditions it holds under.
+"""
+
 from .action import Action, Output, ReconcileResult, action
 from .core import Input, Query, query
 from .errors import (

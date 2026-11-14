@@ -1,3 +1,12 @@
+"""Standard-library analyzers built on the kernel.
+
+The package exports high-level entrypoints and frozen result records for Python
+source, scopes and symbols, configuration files, CSV data, requirements,
+installed packages, dependency checks, module resolution and notebooks, plus the
+shared source geometry and the request-scope helpers.
+`docs/integration-contract.md` lists the surface.
+"""
+
 from ._decoding import once_per_request, request_inputs_changed, request_scope
 from .csv_data import (
     CsvAnalysis,

@@ -45,6 +45,12 @@ class ValueAdapter(Protocol):
 
 @dataclass(frozen=True)
 class FrozenList(Sequence[Any]):
+    """Owned snapshot of a list, items in their original order.
+
+    It reads as a sequence. `strict` exposes this view, and `thaw` rebuilds a
+    `list`.
+    """
+
     items: tuple[Any, ...]
 
     @overload
@@ -116,6 +122,13 @@ class FrozenSet:
 
 @dataclass(frozen=True)
 class FrozenRecord(Mapping[str, Any]):
+    """Owned snapshot of a dataclass: its `__qualname__` and fields in declaration order.
+
+    `type_name` carries no module, so same-named dataclasses in different
+    modules share a tag. It reads as a mapping of field name to value. `thaw`
+    rebuilds a `dict`, and rebuilding the class takes a `ValueAdapter`.
+    """
+
     type_name: str
     entries: tuple[tuple[str, Any], ...]
 
@@ -134,6 +147,14 @@ class FrozenRecord(Mapping[str, Any]):
 
 @dataclass(frozen=True)
 class FrozenAdapterValue:
+    """Snapshot of a value a registered `ValueAdapter` froze.
+
+    `adapter_key` is the registered type's `module:qualname`, and `payload` is
+    the frozen form of what the adapter's `freeze` returned. `thaw` hands the
+    payload to the adapter registered under that key, and raises
+    `UnsupportedValueError` when there is none.
+    """
+
     adapter_key: str
     payload: Any
 
@@ -879,6 +900,14 @@ def _collect_adapter_keys(value: Any, keys: set[str]) -> None:
 
 
 def thaw(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> Any:
+    """Rebuild the mutable form of a snapshot, using only the given `adapters`.
+
+    Lists come back as `list`, mappings and records as `dict`, and sets as `set`
+    or `frozenset`. A `FrozenGraph` comes back with its shared and cyclic
+    references rebuilt. Raises `UnsupportedValueError` for a value outside the
+    snapshot grammar, an adapted value whose adapter is not registered, or a
+    mapping key or set member that thaws into an unhashable value.
+    """
     _validate_snapshot(value)
     registry = _coerce_registry(adapters)
     if isinstance(value, FrozenGraph):
@@ -1605,6 +1634,12 @@ def snapshots_equal(left: Any, right: Any) -> bool:
 def semantic_equal(
     left: Any, right: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None
 ) -> bool:
+    """Report whether two values freeze to snapshots with one canonical encoding.
+
+    This is the kernel's default equality, so `1`, `1.0` and `True` differ.
+    Raises `UnsupportedValueError` for a value `freeze` refuses with these
+    `adapters`.
+    """
     return snapshots_equal(
         freeze(left, adapters=adapters), freeze(right, adapters=adapters)
     )

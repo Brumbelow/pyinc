@@ -28,6 +28,16 @@ CutoffFn = Callable[[Any], Any]
 
 @dataclass(frozen=True, eq=False)
 class Input(Generic[T]):
+    """A declared input named by `key`, whose value enters through `db.set`.
+
+    `key` is a non-empty plain `str` and the whole of the input's identity.
+    `eq=` or `cutoff=`, at most one of them, decides when an update counts as
+    unchanged. Construction raises `InputKeyError` for a key that is not a
+    non-empty plain `str`, `ValueError` when both policies are given, and
+    `TypeError` for a policy that is not callable. `read(db)` is
+    `db.read_input(self)`.
+    """
+
     key: str
     eq: EqFn | None = field(default=None, kw_only=True)
     cutoff: CutoffFn | None = field(default=None, kw_only=True)
@@ -59,6 +69,16 @@ class Input(Generic[T]):
 
 
 class Query(Generic[P, T]):
+    """The handle `@query` returns for a query function.
+
+    `handle(db, *args, **kwargs)` is `db.get(handle, *args, **kwargs)`. `key`
+    defaults to `module:qualname`. `eq=` or `cutoff=`, at most one of them,
+    decides when a recomputed result counts as unchanged. Construction raises
+    `TypeError` for an object that is not a Python function, for a coroutine or
+    generator function, and for a policy that is not callable. It raises
+    `ValueError` for both policies or a key that is not a non-empty plain `str`.
+    """
+
     def __init__(
         self,
         fn: Callable[Concatenate[Database, P], T],
@@ -131,6 +151,13 @@ def query(
     eq: EqFn | None = None,
     cutoff: CutoffFn | None = None,
 ) -> Query[P, T] | Callable[[Callable[Concatenate[Database, P], T]], Query[P, T]]:
+    """Declare a query function and return the `Query` handle for it.
+
+    Applied bare, `@query` wraps the function at once. Called with keyword
+    options, `@query(key=...)`, it returns the decorator. The options and the
+    errors are those of `Query`.
+    """
+
     def decorate(wrapped: Callable[Concatenate[Database, P], T]) -> Query[P, T]:
         return Query(wrapped, key=key, eq=eq, cutoff=cutoff)
 

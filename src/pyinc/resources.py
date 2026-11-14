@@ -137,6 +137,14 @@ FileProbe = tuple[str, str] | tuple[str]
 
 @dataclass(frozen=True)
 class FileResource(Resource[str | os.PathLike[str], str, FileProbe]):
+    """Text-file resource: the key is a path, the value its text in `encoding`.
+
+    The probe is `("present", <sha256 hex of the bytes>)`, or `("missing",)` for
+    an absent path, a directory, a pipe, a socket or a device, where a load
+    raises `FileNotFoundError`. A permission denial propagates. A link loop or a
+    path holding a NUL raises `UnsafeFilesystemPathError`.
+    """
+
     encoding: str = "utf-8"
 
     def read(self, db: _runtime.Database, key: str | os.PathLike[str]) -> str:
@@ -168,6 +176,11 @@ class FileResource(Resource[str | os.PathLike[str], str, FileProbe]):
 
 @dataclass(frozen=True)
 class BinaryFileResource(Resource[str | os.PathLike[str], bytes, FileProbe]):
+    """Byte-file resource: the key is a path, the value the file's raw bytes.
+
+    The probe and the errors are those of `FileResource`.
+    """
+
     def read(self, db: _runtime.Database, key: str | os.PathLike[str]) -> bytes:
         return db.read_resource(self, os.fspath(key))
 
@@ -197,6 +210,12 @@ class BinaryFileResource(Resource[str | os.PathLike[str], bytes, FileProbe]):
 
 @dataclass(frozen=True)
 class FileStatSnapshot:
+    """One stat reading of a path, the value of `FileStatResource`.
+
+    `size` is `st_size` and `mtime_ns` is `st_mtime_ns`. Both are None when
+    `exists` is false.
+    """
+
     exists: bool
     size: int | None
     mtime_ns: int | None
@@ -257,6 +276,14 @@ BUILTIN_ADAPTERS: Mapping[type[Any], ValueAdapter] = MappingProxyType(
 
 @dataclass(frozen=True)
 class FileStatResource(Resource[str | os.PathLike[str], FileStatSnapshot, FileStatProbe]):
+    """Stat resource: the key is a path, the value a `FileStatSnapshot`.
+
+    The file is never opened, and a directory is read like a file. The probe is
+    the snapshot's three fields. An absent path reads as `exists=False`, and a
+    permission denial propagates. A link loop or a path holding a NUL raises
+    `UnsafeFilesystemPathError`.
+    """
+
     def read(self, db: _runtime.Database, key: str | os.PathLike[str]) -> FileStatSnapshot:
         return db.read_resource(self, os.fspath(key))
 
@@ -278,6 +305,11 @@ class FileStatResource(Resource[str | os.PathLike[str], FileStatSnapshot, FileSt
 
 @dataclass(frozen=True)
 class EnvResource(Resource[str, str | None, tuple[str | None]]):
+    """Environment-variable resource: the key is a name, the value `os.environ.get(name)`.
+
+    An unset variable reads as None. The probe is the value in a 1-tuple.
+    """
+
     def label(self, name: str) -> str:
         return f"env[{name}]"
 
@@ -372,6 +404,14 @@ DirectoryProbe = tuple[bool, tuple[str, ...]]
 
 @dataclass(frozen=True)
 class DirectoryResource(Resource[str | os.PathLike[str], tuple[str, ...], DirectoryProbe]):
+    """Directory-listing resource: the key is a path, the value its sorted entry names.
+
+    An absent path lists as `()`. A path that is not a directory raises the
+    platform's error from the load, and its probe differs from an absent
+    path's. A permission denial propagates. A link loop or a path holding a NUL
+    raises `UnsafeFilesystemPathError`.
+    """
+
     def read(self, db: _runtime.Database, key: str | os.PathLike[str]) -> tuple[str, ...]:
         return db.read_resource(self, os.fspath(key))
 

@@ -7,6 +7,14 @@ from typing import Any, cast
 
 @dataclass(frozen=True)
 class InspectionNode:
+    """One node of the provenance tree `Database.inspect()` returns.
+
+    It carries the node's label, kind, revisions and decision fields, with the
+    nodes it read as `dependencies` in label order. The kernel contract's Node
+    Record Fields section defines the decision fields. `is_untracked` is true
+    when the node's last run recorded an untracked reason.
+    """
+
     label: str
     kind: str
     changed_at: int
@@ -24,6 +32,15 @@ class InspectionNode:
 
 @dataclass(frozen=True)
 class CaptureInfo:
+    """One entry of an `explain_query_captures` report.
+
+    `name` names the capture and `origin` where the query holds it, such as
+    `"global"`, `"closure"` or `"default"`. `type_name` is the captured value's
+    type. `accepted` is the fingerprint's verdict and `kind` the arm that gave
+    it, `"rejected"` on a refusal, with the refusal's message in
+    `rejection_reason`.
+    """
+
     name: str
     origin: str
     type_name: str
@@ -234,6 +251,14 @@ def _classify_handle_state(query: Any) -> list[CaptureInfo]:
 
 
 def explain_query_captures(fn_or_query: Any) -> tuple[CaptureInfo, ...]:
+    """Preview how the kernel classifies each capture of a query function.
+
+    Takes a function or a `Query` handle. Returns a `CaptureInfo` for each
+    reflective namespace read, default, closure cell, global, annotation,
+    function attribute and type parameter, then, given a handle, for its own
+    state. Each verdict comes from a `Database` with the default adapters.
+    Raises `TypeError` for anything else.
+    """
     from .core import Query
     from .errors import UnsupportedValueError
     from .runtime import Database, _reflective_namespace_offenses, _refused_import_statements

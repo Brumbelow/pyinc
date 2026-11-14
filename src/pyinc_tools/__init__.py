@@ -1,3 +1,11 @@
+"""The workspace session, watcher and editor result types behind `pyinc-tools`.
+
+`WorkspaceSession` answers analysis and editor requests over one workspace root
+from `pyinc.integrations`. `PollingWorkspaceWatcher` polls that root and hands
+the session the changed paths. The `pyinc-tools analyze` and `pyinc-tools lsp`
+commands live in `pyinc_tools.cli`.
+"""
+
 from .session import (
     AnalysisDiagnostic,
     CallHierarchyCallSite,

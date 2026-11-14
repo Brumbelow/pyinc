@@ -1,3 +1,11 @@
+"""The `Database` class with its node records, fingerprints, guard and checkpoints.
+
+`Database` holds inputs, queries and resources as node records. On each request
+it checks a node's dependencies, then reuses, backdates or re-executes it. Query
+identity folds the query's code and captures, and the ambient-read guard refuses
+the ambient reads it intercepts inside a query.
+"""
+
 from __future__ import annotations
 
 import builtins
@@ -948,6 +956,14 @@ class _IdentityMemoEntry:
 
 @dataclass(frozen=True)
 class DatabaseStatistics:
+    """Node counts and work counters for one database, from `Database.statistics()`.
+
+    `node_count`, `input_count`, `query_count` and `resource_count` count what
+    the database holds now. The work counters count events since construction
+    or the last `reset_statistics()`. `total_requests` counts the requests the
+    database has opened since construction, and a reset leaves it alone.
+    """
+
     node_count: int
     input_count: int
     query_count: int
@@ -965,6 +981,15 @@ class DatabaseStatistics:
 
 @dataclass(frozen=True)
 class DependencyGraphNode:
+    """One node of `Database.dependency_graph()`.
+
+    `kind` is `"input"`, `"query"` or `"resource"`. `changed_at` and
+    `verified_at` are revisions, and `last_decision` is the field `inspect`
+    reports. `is_untracked` is true when the node's last run recorded an
+    untracked reason. `dependency_labels` holds the sorted labels of the nodes
+    this one read that the database still holds.
+    """
+
     label: str
     kind: str
     changed_at: int
@@ -976,6 +1001,13 @@ class DependencyGraphNode:
 
 @dataclass(frozen=True)
 class QueryProfile:
+    """Execution timing for one query node, from `Database.query_profile()`.
+
+    A run counts once its result is recorded, a backdated one included.
+    Each time is the `time.perf_counter_ns()` span of the body call, so it
+    includes the sub-queries the body requested. `mean_ns` is the integer mean.
+    """
+
     query_label: str
     execution_count: int
     total_ns: int
@@ -1850,6 +1882,16 @@ class Subscription:
 
 
 class Database:
+    """The incremental query database over inputs, queries and resources.
+
+    `mode` is `"strict"`, `"checked"` or `"fast"`. `adapters` extends
+    `BUILTIN_ADAPTERS`. `max_query_nodes` caps the query nodes kept, by LRU
+    eviction. `observer_error_hook` receives observer exceptions. `store`
+    receives every frozen snapshot and backs the checkpoint calls. Raises
+    `ValueError` for an unknown mode or a cap that is not a positive `int`,
+    and `TypeError` for a store that does not implement `ArtifactStore`.
+    """
+
     # The two instance-dictionary names a query handle carries its annotations
     # under. They are folded and observed through the annotation vocabulary in
     # place of the ambient-capture one, so an annotation naming a
@@ -2122,11 +2164,23 @@ class Database:
 
     @property
     def revision(self) -> int:
+        """The database's revision counter.
+
+        It starts at 0 and moves forward when an input is set to a new value,
+        when a resource read finds a change, and when a re-executed query lands
+        a new result. Raises `ReentrantDatabaseError` inside a query, a resource
+        hook, or a thread either one started.
+        """
         self._reject_inside_query("db.revision")
         with self._state_lock:
             return self._revision
 
     def statistics(self) -> DatabaseStatistics:
+        """Return the node counts and work counters as `DatabaseStatistics`.
+
+        Raises `ReentrantDatabaseError` inside a query, a resource hook, or a
+        thread either one started.
+        """
         self._reject_inside_query("db.statistics()")
         with self._state_lock:
             resource_count = sum(1 for k in self._records if k.kind == "resource")
@@ -2147,6 +2201,12 @@ class Database:
             )
 
     def reset_statistics(self) -> None:
+        """Zero the work counters and drop every query's timing profile.
+
+        The node counts and `total_requests` stay as they are. Raises
+        `ReentrantDatabaseError` inside a query, a resource hook, or a thread
+        either one started.
+        """
         self._reject_inside_query("db.reset_statistics()")
         with self._state_lock:
             for key in self._stats:
@@ -2154,6 +2214,12 @@ class Database:
             self._query_timings.clear()
 
     def query_profile(self) -> tuple[QueryProfile, ...]:
+        """Return a `QueryProfile` for each query node with timings, by label.
+
+        Evicting a node drops its timings, and `reset_statistics()` drops them
+        all. Raises `ReentrantDatabaseError` inside a query, a resource hook, or
+        a thread either one started.
+        """
         self._reject_inside_query("db.query_profile()")
         with self._state_lock:
             profiles: list[QueryProfile] = []
@@ -2172,6 +2238,12 @@ class Database:
             return tuple(profiles)
 
     def dependency_graph(self) -> tuple[DependencyGraphNode, ...]:
+        """Return a `DependencyGraphNode` for every node the database holds, by label.
+
+        Inputs, queries and resources are all included. Raises
+        `ReentrantDatabaseError` inside a query, a resource hook, or a thread
+        either one started.
+        """
         self._reject_inside_query("db.dependency_graph()")
         with self._state_lock:
             nodes: list[DependencyGraphNode] = []
@@ -2197,6 +2269,15 @@ class Database:
             return tuple(sorted(nodes, key=lambda n: n.label))
 
     def set(self, input_key: Any, value: Any) -> None:
+        """Store `value` as the value of `input_key`.
+
+        A value the input's policy calls equal leaves the revision in place, and
+        a new one moves it by one. A call that raises changes nothing. Raises
+        `TypeError` for a key that is not an `Input`, `InputKeyError` for one
+        registered under another policy, `UnsupportedValueError` for a value
+        `freeze` refuses, and `ReentrantDatabaseError` inside a query, a
+        resource hook, or a thread either one started.
+        """
         # Ahead of the type check and the lock: a refusal that ran after the
         # key was resolved could leave a registration behind for an input the
         # caller was never allowed to declare here. The body extends the rule
@@ -2269,6 +2350,13 @@ class Database:
             self._roll_span_request()
 
     def set_many(self, updates: Iterable[tuple[Any, Any]]) -> None:
+        """Store several `(Input, value)` pairs as one change.
+
+        The batch moves the revision once when any value is new, and a batch
+        that raises changes nothing. Raises `TypeError` for an item that is not
+        such a pair, `InputKeyError` for a key given twice or registered under
+        another policy, and otherwise what `set` raises.
+        """
         # Ahead of the materialization below: draining the caller's iterable is
         # itself observable, and a refused call must leave it unpulled.
         self._reject_inside_query("db.set_many()")
@@ -2378,6 +2466,15 @@ class Database:
             self._roll_span_request()
 
     def get(self, query: _core.Query[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+        """Return the result of `query` called with `args` and `kwargs`.
+
+        A stored result whose dependencies are unchanged is reused, and
+        otherwise the query executes. Inside a query body the call records a
+        dependency on the answer. Raises `TypeError` when `query` is not a
+        `@query` handle, `CycleError` on a cycle, and what the query raises.
+        Raises `ReentrantDatabaseError` inside a resource hook or a thread a
+        query or hook started.
+        """
         # Always before the lock: a thread spawned inside a query must never
         # wait for a lock its own parent is holding.
         self._reject_reentrant_read("db.get()")
@@ -2431,6 +2528,10 @@ class Database:
         return result
 
     def explain(self, query: _core.Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> str:
+        """Return the provenance tree `inspect` gives for this call, as indented text.
+
+        The arguments and the errors are those of `inspect`.
+        """
         # Checked here, ahead of the inspect below, so the refusal names the
         # call the caller made.
         self._reject_inside_query("db.explain()")
@@ -2443,6 +2544,14 @@ class Database:
     def inspect(
         self, query: _core.Query[P, Any], *args: P.args, **kwargs: P.kwargs
     ) -> InspectionNode:
+        """Return the recorded provenance tree of a query call as an `InspectionNode`.
+
+        A call with a record answers from it without verifying it. A call with
+        no record executes first. Raises `TypeError` when `query` is not a
+        `@query` handle, what a first execution raises, and
+        `ReentrantDatabaseError` inside a query, a resource hook, or a thread
+        either one started.
+        """
         self._reject_inside_query("db.inspect()")
         from .core import Query
 
@@ -2465,6 +2574,12 @@ class Database:
     def inspect_fresh(
         self, query: _core.Query[P, Any], *args: P.args, **kwargs: P.kwargs
     ) -> InspectionNode:
+        """Verify a query call, then return its provenance tree.
+
+        Verification re-executes what changed, as `get` does, so the tree shows
+        this request's decisions. The arguments are those of `inspect`. It
+        raises what `inspect` raises, and what any execution it runs raises.
+        """
         self._reject_inside_query("db.inspect_fresh()")
         from .core import Query
 
@@ -2637,6 +2752,13 @@ class Database:
         return Subscription(self, key, callback, token)
 
     def report_untracked_read(self, reason: str) -> None:
+        """Mark the running query untracked, recording `reason` on its node.
+
+        An untracked query re-executes on every request and never backdates.
+        Raises `RuntimeError` when no query is running, and
+        `ReentrantDatabaseError` inside a resource hook or a thread a query or
+        hook started.
+        """
         # Before the lock, which this method takes ahead of everything else. A
         # spawned thread would block there and never reach the frame check
         # below, and that check would let it through anyway, because a
@@ -3783,6 +3905,14 @@ class Database:
         return key.identity.rsplit(":", 1)[0]
 
     def read_input(self, input_key: _core.Input[T]) -> T:
+        """Return the current value of `input_key`.
+
+        Inside a query body the read records a dependency on the input. Raises
+        `TypeError` for a key that is not an `Input`, `KeyError` for an input
+        never set, `InputKeyError` for a key registered under another policy,
+        and `ReentrantDatabaseError` inside a resource hook or a thread a query
+        or hook started.
+        """
         self._reject_reentrant_read("db.read_input()")
         from .core import Input
 
@@ -3813,6 +3943,15 @@ class Database:
     def read_resource(self, resource: Any, parameter: Any) -> Any: ...
 
     def read_resource(self, resource: Any, parameter: Any) -> Any:
+        """Return the value `resource` gives for `parameter`.
+
+        A stored value is reused while the resource's probe is unchanged, and
+        otherwise the resource is read again. Inside a query body the read
+        records a dependency on the resource node. An exception from a load
+        propagates, and the kernel contract's Failing Resource Loads section
+        says what the node records. Raises `ReentrantDatabaseError` inside a
+        resource hook or a thread a query or hook started.
+        """
         self._reject_reentrant_read("db.read_resource()")
         with self._top_level_request() as pending:
             key = self._resource_key(resource, parameter)
