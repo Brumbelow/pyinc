@@ -38,7 +38,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e '.[dev]'
+          python -m pip install -c constraints.txt -e '.[dev]'
 
       - name: Confirm the interpreter runs without the GIL
         if: endsWith(matrix.python-version, 't')

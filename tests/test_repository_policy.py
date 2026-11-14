@@ -1,9 +1,17 @@
-"""How the repository splits its suite across CI jobs."""
+"""How the repository splits its suite across CI jobs and pins its tools."""
 
 from __future__ import annotations
 
+import tomllib
+from pathlib import Path
+
 import pytest
 from conftest import in_shard, parse_shard
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import Version
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # Shaped like the node ids pytest writes, which use forward slashes on every
 # operating system.
@@ -32,3 +40,26 @@ def test_the_test_shards_partition_the_collection(count: int) -> None:
 def test_a_malformed_test_shard_is_refused(value: str) -> None:
     with pytest.raises(pytest.UsageError, match="PYINC_TEST_SHARD"):
         parse_shard(value)
+
+
+def test_the_constraints_file_pins_every_dev_and_bench_requirement() -> None:
+    project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = project["project"]["optional-dependencies"]
+    wanted = [Requirement(line) for name in ("dev", "bench") for line in extras[name]]
+
+    pins: dict[str, list[Requirement]] = {}
+    constraints = (PROJECT_ROOT / "constraints.txt").read_text(encoding="utf-8")
+    for line in constraints.splitlines():
+        line = line.partition("#")[0].strip()
+        if line:
+            pin = Requirement(line)
+            pins.setdefault(canonicalize_name(pin.name), []).append(pin)
+
+    for requirement in wanted:
+        found = pins.get(canonicalize_name(requirement.name), [])
+        assert len(found) == 1, f"{requirement.name} needs exactly one line in constraints.txt"
+        (specifier,) = found[0].specifier
+        assert specifier.operator == "==", f"{found[0]} is not an exact pin"
+        assert Version(specifier.version) in requirement.specifier, (
+            f"{found[0]} is outside {requirement} in pyproject.toml"
+        )

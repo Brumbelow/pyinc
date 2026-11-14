@@ -22,8 +22,9 @@ from pathlib import Path
 import pytest
 
 # Tests that verify the repository as shipped: its docs, release metadata
-# and artifacts, the bench harness, the cutoff inventory, and the test shards.
-# They give the same result on every operating system and interpreter.
+# and artifacts, the bench harness, the cutoff inventory, the test shards
+# and the tool pins. They give the same result on every operating system
+# and interpreter.
 _PROCESS_FILES = frozenset(
     {
         "test_bench_smoke.py",

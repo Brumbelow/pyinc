@@ -17,7 +17,7 @@ git clone https://github.com/Brumbelow/pyinc.git
 cd pyinc
 python3 -m venv .venv
 . .venv/bin/activate
-python3 -m pip install -e '.[dev]'
+python3 -m pip install -e '.[dev]' -c constraints.txt
 ```
 
 Python 3.11 or newer is required. `pyproject.toml` pins `target-version =
