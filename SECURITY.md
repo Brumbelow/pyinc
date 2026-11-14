@@ -3,12 +3,15 @@
 ## Supported versions
 
 Only the current release line is maintained. Every fix, security fixes
-included, lands on that line alone. `pyinc` follows semantic versioning. That
-contract covers what `pyinc` and `pyinc.integrations` export, and only that.
-`pyinc_tools` and `pyinc_codegen` ship in the same distribution and are fully
-documented, but they are **unstable**. Their exported names, the fields of
-their result types, the `pyinc-tools` command-line surface and the LSP wire
-behavior may change in any release, including a minor one.
+included, lands on that line alone. `pyinc` is feature-complete, so a release
+carries bug, soundness and security fixes and no new features.
+
+`pyinc` follows semantic versioning. That contract covers what `pyinc` and
+`pyinc.integrations` export, and only that. `pyinc_tools` and `pyinc_codegen`
+ship in the same distribution and are fully documented. They are
+**feature-frozen**: their exported names, the fields of their result types,
+the `pyinc-tools` command-line surface and the LSP wire behavior change only
+to fix a defect.
 
 | Version | Supported |
 |---|---|

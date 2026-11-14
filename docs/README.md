@@ -16,7 +16,7 @@ results to disk. Each document below has one job.
 | [Demo](demo.md) | See the watcher running on a real workspace. |
 | [FAQ](faq.md) | Compare pyinc with Salsa or `lru_cache`, see what is out of scope, or decide whether it fits your workload. |
 | [Codegen Guide](codegen-guide.md) | Generate typed Python models from JSON Schema through the action layer. |
-| [Releases and Verification](releases.md) | Check a published artifact, or see what the release pipeline enforces. |
+| [Releases and Verification](releases.md) | Cut a release, check a published artifact, or see what the release pipeline enforces. |
 
 ## Depend on a contract
 

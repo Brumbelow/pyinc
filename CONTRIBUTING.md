@@ -10,7 +10,7 @@ python3 -m venv .venv
 python3 -m pip install -e '.[dev]' -c constraints.txt
 ```
 
-Python 3.11 or newer is required. `constraints.txt` pins the versions CI uses.
+Python 3.11 to 3.14 is required. `constraints.txt` pins the versions CI uses.
 
 ## Tests and static checks
 
