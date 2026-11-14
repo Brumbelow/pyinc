@@ -66,41 +66,46 @@ def parse_version(text: str) -> Version | None:
     if match is None:
         return None
 
-    epoch = int(match.group("epoch")) if match.group("epoch") else 0
-    release = tuple(int(part) for part in match.group("release").split("."))
+    # int() refuses a digit string longer than sys.get_int_max_str_digits(),
+    # 4,300 by default. A component that long is not a version.
+    try:
+        epoch = int(match.group("epoch")) if match.group("epoch") else 0
+        release = tuple(int(part) for part in match.group("release").split("."))
 
-    pre_letter = match.group("pre_l")
-    if pre_letter is not None:
-        canonical = _canonical_pre(pre_letter)
-        if canonical is None:
-            return None
-        pre_number = int(match.group("pre_n")) if match.group("pre_n") else 0
-        pre: tuple[str, int] | None = (canonical, pre_number)
-    else:
-        pre = None
+        pre_letter = match.group("pre_l")
+        if pre_letter is not None:
+            canonical = _canonical_pre(pre_letter)
+            if canonical is None:
+                return None
+            pre_number = int(match.group("pre_n")) if match.group("pre_n") else 0
+            pre: tuple[str, int] | None = (canonical, pre_number)
+        else:
+            pre = None
 
-    post: int | None
-    if match.group("post_n1") is not None:
-        post = int(match.group("post_n1"))
-    elif match.group("post_l") is not None:
-        post = int(match.group("post_n2")) if match.group("post_n2") else 0
-    else:
-        post = None
+        post: int | None
+        if match.group("post_n1") is not None:
+            post = int(match.group("post_n1"))
+        elif match.group("post_l") is not None:
+            post = int(match.group("post_n2")) if match.group("post_n2") else 0
+        else:
+            post = None
 
-    dev: int | None
-    if match.group("dev_l") is not None:
-        dev = int(match.group("dev_n")) if match.group("dev_n") else 0
-    else:
-        dev = None
+        dev: int | None
+        if match.group("dev_l") is not None:
+            dev = int(match.group("dev_n")) if match.group("dev_n") else 0
+        else:
+            dev = None
 
-    local_raw = match.group("local")
-    if local_raw is None:
-        local: tuple[str | int, ...] = ()
-    else:
-        parts: list[str | int] = []
-        for component in re.split(r"[-_.]", local_raw):
-            parts.append(int(component) if component.isdigit() else component)
-        local = tuple(parts)
+        local_raw = match.group("local")
+        if local_raw is None:
+            local: tuple[str | int, ...] = ()
+        else:
+            parts: list[str | int] = []
+            for component in re.split(r"[-_.]", local_raw):
+                parts.append(int(component) if component.isdigit() else component)
+            local = tuple(parts)
+    except ValueError:
+        return None
 
     return Version(
         epoch=epoch,

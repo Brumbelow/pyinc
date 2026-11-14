@@ -195,6 +195,8 @@ Evaluation targets the current process environment only. Extras are not
 modeled. Noisy or unknown marker variables produce diagnostics. This API never
 resolves or installs dependencies. Unsupported or unparseable constraints are
 reported as ambiguous and never guessed.
+A numeric component longer than the interpreter's integer string conversion
+limit, 4,300 digits by default, makes a version unparseable.
 
 ## Environment files
 

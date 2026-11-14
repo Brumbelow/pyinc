@@ -986,6 +986,21 @@ def test_version_specifier_evaluation_decode_shape() -> None:
     assert result.satisfied is True
 
 
+def test_version_component_beyond_the_int_conversion_limit_is_unparseable() -> None:
+    from pyinc.integrations._pep440 import parse_version
+
+    huge = "9" * 5000
+    assert parse_version(huge) is None
+
+    db = Database()
+    as_specifier = evaluate_version_specifier(db, ">=" + huge, "1.0")
+    assert as_specifier.satisfied is False
+    assert as_specifier.detail == f"cannot evaluate: >={huge}"
+    as_version = evaluate_version_specifier(db, ">=1.0", huge)
+    assert as_version.satisfied is False
+    assert as_version.detail == f"unparseable version: {huge}"
+
+
 @pytest.mark.parametrize(
     "spec_text",
     [
