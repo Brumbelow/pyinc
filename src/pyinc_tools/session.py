@@ -1065,8 +1065,21 @@ class WorkspaceSession:
         path: str | os.PathLike[str],
         symbol_id: SymbolId,
     ) -> tuple[LinkedEditingRange, ...]:
-        highlights = self.find_document_highlights(path, symbol_id)
-        return tuple(LinkedEditingRange(range=highlight.range) for highlight in highlights)
+        with self._state_lock:
+            highlights = self.find_document_highlights(path, symbol_id)
+            # Linked ranges must hold the same text. A use spelled with an
+            # import alias refers to the symbol under another name, so it is
+            # left out.
+            mirror_path = self._mirror_path_for_real(self._normalize_real_path(path))
+            lexical = scope_tree(self.db, str(mirror_path))
+            same_spelling = {
+                item.range for item in lexical.occurrences if item.name == symbol_id.name
+            }
+            return tuple(
+                LinkedEditingRange(range=highlight.range)
+                for highlight in highlights
+                if highlight.range in same_spelling
+            )
 
     def signature_help_at(
         self,
@@ -2882,6 +2895,16 @@ class WorkspaceSession:
             for ref in references.references:
                 ref_real_path = self._remap_path(ref.path) or ref.path
                 source_range = ref.range
+                if not ref.is_declaration:
+                    # A use spelled with an import alias keeps the alias.
+                    # Only the source name on the import line changes, and
+                    # the import edits below cover it.
+                    lexical = scope_tree(self.db, str(self._mirror_path_for_real(ref_real_path)))
+                    if not any(
+                        item.range == source_range and item.name == bare_old
+                        for item in lexical.occurrences
+                    ):
+                        continue
                 if (
                     ref.is_declaration
                     and source_range.start.character == 0

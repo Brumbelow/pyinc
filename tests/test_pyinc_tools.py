@@ -1820,6 +1820,37 @@ def test_language_server_linked_editing_range_excludes_other_files(
             server._session.close()
 
 
+def test_language_server_linked_editing_range_leaves_out_uses_spelled_with_an_alias(
+    tmp_path: Path,
+) -> None:
+    # `f()` refers to `foo` but has other text, so it cannot be a linked range.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "a.py"
+    consumer = root / "b.py"
+    _write(provider, "def foo() -> int:\n    return 1\n")
+    _write(consumer, "from a import foo, foo as f\n\nfoo()\nf()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+
+        result = server._handle_request(
+            "textDocument/linkedEditingRange",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 1},
+            },
+        )
+
+        assert result["ranges"] == [
+            {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 3}}
+        ]
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
 def test_language_server_linked_editing_range_on_unknown_identifier_returns_none(
     tmp_path: Path,
 ) -> None:
@@ -3073,14 +3104,65 @@ def test_rename_symbol_relative_import_preserves_as_alias(tmp_path: Path) -> Non
         assert result.status == "ok"
         sub_edits = [e for e in result.edits if Path(e.path).name == "sub.py"]
         # One edit on sub.py, the import-site `foo`, and no other. The
-        # `as aliased` clause is preserved and `aliased()` is not a reference
-        # to `foo`.
+        # `as aliased` clause is preserved and `aliased()` keeps its name.
         assert len(sub_edits) == 1
         assert sub_edits[0].range.start.character == 20
         assert sub_edits[0].range.end.character == 23
         _apply_rename_edits(result.edits)
 
     assert (pkg / "sub.py").read_text() == "from .helper import bar as aliased\n\naliased()\n"
+
+
+def test_alias_uses_resolve_to_and_count_for_the_source_definition(tmp_path: Path) -> None:
+    # a.py also defines the alias name. A use of `_t` in b.py must still land
+    # on `t` and count toward its references.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def _t() -> int:\n    return 1\n\n\ndef t() -> int:\n    return 2\n")
+    _write(root / "b.py", "from a import t as _t\n\n_t()\n_t()\n")
+
+    with WorkspaceSession(root) as session:
+        definition = SymbolId(str(root / "a.py"), "module", "t", _range(4, 4, 4, 5))
+        assert session.symbol_at(root / "b.py", SourcePosition(2, 0)) == definition
+        references = session.find_references(definition, include_declaration=False)
+        assert [(Path(ref.path).name, ref.range) for ref in references.references] == [
+            ("b.py", _range(2, 0, 2, 2)),
+            ("b.py", _range(3, 0, 3, 2)),
+        ]
+        lenses = {
+            lens.range.start.line: lens.title
+            for lens in session.code_lenses_for_file(root / "a.py")
+        }
+        assert lenses == {0: "0 references", 4: "2 references"}
+
+
+def test_rename_symbol_leaves_uses_spelled_with_an_alias(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "b.py", "from a import foo, foo as f\n\nfoo()\nf()\n")
+
+    with WorkspaceSession(root) as session:
+        target = _symbol_for_name(session, root / "a.py", "foo")
+        references = session.find_references(target, include_declaration=False)
+        assert [(Path(ref.path).name, ref.range) for ref in references.references] == [
+            ("b.py", _range(2, 0, 2, 3)),
+            ("b.py", _range(3, 0, 3, 1)),
+        ]
+        result = session.rename_symbol(target, "bar")
+        assert result.status == "ok"
+        # Both source names on the import line change. The alias `f` and its
+        # use keep their spelling.
+        assert [(Path(edit.path).name, edit.range) for edit in result.edits] == [
+            ("a.py", _range(0, 4, 0, 7)),
+            ("b.py", _range(0, 14, 0, 17)),
+            ("b.py", _range(0, 19, 0, 22)),
+            ("b.py", _range(2, 0, 2, 3)),
+        ]
+        _apply_rename_edits(result.edits)
+
+    assert (root / "a.py").read_text() == "def bar() -> int:\n    return 1\n"
+    assert (root / "b.py").read_text() == "from a import bar, bar as f\n\nbar()\nf()\n"
 
 
 def test_rename_symbol_rewrites_attribute_access_through_module_import(

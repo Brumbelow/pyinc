@@ -1183,19 +1183,28 @@ def _symbol_at(
 
 
 def _symbol_id_for_resolved(db: Database, resolved: object) -> SymbolId | None:
+    # The definition is the binding at the resolved range. A module target
+    # has no range and gets no symbol. A match on the name alone could pick a
+    # binding of the same name in another scope.
     defining_path = getattr(resolved, "defining_path", None)
     qualified_name = getattr(resolved, "qualified_name", None)
-    if not isinstance(defining_path, str) or not isinstance(qualified_name, str):
+    defining_range = getattr(resolved, "range", None)
+    if (
+        not isinstance(defining_path, str)
+        or not isinstance(qualified_name, str)
+        or not isinstance(defining_range, SourceRange)
+    ):
         return None
     name = qualified_name.rsplit(".", 1)[-1]
     tree = scope_tree(db, defining_path)
-    candidates = [item.symbol_id for item in tree.bindings if item.name == name]
-    defining_range = getattr(resolved, "range", None)
-    if isinstance(defining_range, SourceRange):
-        candidates = [
-            item for item in candidates if item.declaration.start.line == defining_range.start.line
-        ] or candidates
-    return candidates[0] if candidates else None
+    return next(
+        (
+            item.symbol_id
+            for item in tree.bindings
+            if item.name == name and item.range == defining_range
+        ),
+        None,
+    )
 
 
 def _resolve_attribute(

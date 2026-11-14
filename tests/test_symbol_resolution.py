@@ -1642,6 +1642,170 @@ def test_symbol_at_returns_none_for_ambiguous_target(tmp_path: Path) -> None:
     assert symbol_at(db, root, root / "a.py", SourcePosition(0, 15)) is None
 
 
+def test_symbol_at_through_from_import_alias_finds_the_source_definition(
+    tmp_path: Path,
+) -> None:
+    # The defining file also binds the alias name, so a lookup by the
+    # spelling at the use site lands on the wrong function.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text(
+        "def _t() -> int:\n    return 1\n\n\ndef t() -> int:\n    return 2\n",
+        encoding="utf-8",
+    )
+    consumer = root / "b.py"
+    consumer.write_text("from a import t as _t\n\n_t()\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    resolved = symbol_at(db, root, consumer, SourcePosition(2, 0))
+
+    assert resolved is not None
+    assert resolved.path == str(root / "a.py")
+    assert resolved.scope_id == "module"
+    assert resolved.name == "t"
+    assert resolved.declaration == SourceRange(SourcePosition(4, 4), SourcePosition(4, 5))
+
+
+def test_resolve_qualified_name_through_alias_reports_the_source_name_and_range(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("def t() -> int:\n    return 2\n", encoding="utf-8")
+    consumer = root / "b.py"
+    consumer.write_text("from a import t as _t\n\n_t()\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    resolved = resolve_symbol(db, root, consumer, "_t")
+
+    assert resolved.resolution == "workspace"
+    assert resolved.defining_path == str(root / "a.py")
+    assert resolved.qualified_name == "t"
+    assert resolved.range == SourceRange(SourcePosition(0, 4), SourcePosition(0, 5))
+
+
+def test_symbol_at_attribute_through_aliased_class_finds_the_method(
+    tmp_path: Path,
+) -> None:
+    # A module-level function with the method's name sits beside the class.
+    # The alias must not make the class look like a module.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text(
+        "class C:\n"
+        "    def m(self) -> int:\n"
+        "        return 1\n"
+        "\n"
+        "\n"
+        "def m() -> int:\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    consumer = root / "b.py"
+    consumer.write_text("from a import C as K\n\nK.m()\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    resolved = symbol_at(db, root, consumer, SourcePosition(2, 2))
+
+    assert resolved is not None
+    assert resolved.path == str(root / "a.py")
+    assert resolved.scope_id != "module"
+    assert resolved.name == "m"
+    assert resolved.declaration == SourceRange(SourcePosition(1, 8), SourcePosition(1, 9))
+
+
+def test_symbol_at_module_target_is_not_guessed(tmp_path: Path) -> None:
+    # `sub` names the submodule. The variable `sub` inside it is another
+    # symbol.
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "sub.py").write_text("sub = 1\n", encoding="utf-8")
+    consumer = root / "main.py"
+    consumer.write_text("from pkg import sub\n\nsub\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    assert symbol_at(db, root, consumer, SourcePosition(2, 0)) is None
+
+
+def test_symbol_at_never_confuses_same_named_bindings_in_the_defining_file(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text(
+        "def helper() -> int:\n"
+        "    t = 0\n"
+        "    return t\n"
+        "\n"
+        "\n"
+        "def t() -> int:\n"
+        "    return 1\n"
+        "\n"
+        "\n"
+        "def other() -> int:\n"
+        "    late = 3\n"
+        "    return late\n"
+        "\n"
+        "\n"
+        "(\n"
+        "    late\n"
+        ") = 2\n",
+        encoding="utf-8",
+    )
+    aliased = root / "b.py"
+    aliased.write_text("from a import t as helper\n\nhelper()\n", encoding="utf-8")
+    direct = root / "c.py"
+    direct.write_text("from a import t\n\nt()\n", encoding="utf-8")
+    late_user = root / "d.py"
+    late_user.write_text("from a import late\n\nlate\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    expected = SourceRange(SourcePosition(5, 4), SourcePosition(5, 5))
+    for consumer in (aliased, direct):
+        resolved = symbol_at(db, root, consumer, SourcePosition(2, 0))
+        assert resolved is not None
+        assert (resolved.scope_id, resolved.name) == ("module", "t")
+        assert resolved.declaration == expected
+    # The symbol table records `late` on the line where its statement starts,
+    # and the name sits on the next line. With no binding on the recorded
+    # line, the answer is None and never the local `late` in `other`.
+    assert symbol_at(db, root, late_user, SourcePosition(2, 0)) is None
+
+
+def test_find_references_counts_uses_spelled_with_an_alias(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("def foo() -> int:\n    return 1\n", encoding="utf-8")
+    (root / "b.py").write_text("from a import foo as f\n\nf()\nf()\n", encoding="utf-8")
+    (root / "c.py").write_text("from a import foo\n\nfoo()\n", encoding="utf-8")
+    # d.py aliases another module's `foo` under the same spelling.
+    (root / "other.py").write_text("def foo() -> int:\n    return 9\n", encoding="utf-8")
+    (root / "d.py").write_text("from other import foo as f\n\nf()\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "foo")
+
+    found = [
+        (
+            Path(r.path).name,
+            r.range.start.line,
+            r.range.start.character,
+            r.range.end.character,
+            r.is_declaration,
+        )
+        for r in result.references
+    ]
+    # The import lines bind names of their own, so neither is a reference.
+    assert found == [
+        ("a.py", 0, 4, 7, True),
+        ("b.py", 2, 0, 1, False),
+        ("b.py", 3, 0, 1, False),
+        ("c.py", 2, 0, 3, False),
+    ]
+
+
 def test_subscript_assignment_reads_container_and_index(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()

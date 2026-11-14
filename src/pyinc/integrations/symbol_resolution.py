@@ -1323,7 +1323,10 @@ def _resolve_qualified_name(
     defining_lineno = payload[5]
     if decoded.defining_path is None or defining_lineno is None:
         return decoded
-    name = decoded.qualified_name.rsplit(".", 1)[-1]
+    # The last trail entry is the name as the defining module binds it. Through
+    # `from m import a as b` the request names `b` and the definition is `a`.
+    qualified_name = payload[9][-1].rsplit(":", 1)[1]
+    name = qualified_name.rsplit(".", 1)[-1]
     lexical = scope_tree(db, decoded.defining_path)
     source_range = next(
         (
@@ -1333,7 +1336,7 @@ def _resolve_qualified_name(
         ),
         None,
     )
-    return replace(decoded, range=source_range)
+    return replace(decoded, qualified_name=qualified_name, range=source_range)
 
 
 def workspace_symbol_index(db: Database, root: str | os.PathLike[str]) -> WorkspaceSymbolIndex:
@@ -1396,7 +1399,10 @@ def _find_references_for_symbol(
     Local bindings are compared directly. Module attributes and direct
     ``from`` imports are normalized through the conservative workspace
     resolver before comparison, so an unrelated shadow with the same spelling
-    is excluded.
+    is excluded. A use spelled with the alias of ``from m import name as
+    alias`` is a candidate when ``name`` is the target's name. A second
+    import of that alias, such as ``from importer import alias``, is not
+    followed.
     """
 
     files = db.get(workspace_python_files, root)
@@ -1404,8 +1410,16 @@ def _find_references_for_symbol(
     seen_locations: set[tuple[str, SourceRange]] = set()
     for path in files:
         lexical = scope_tree(db, path)
+        spellings = {target.name}
+        spellings.update(
+            binding.name
+            for binding in lexical.bindings
+            if binding.kind == "from_import_alias"
+            and binding.import_source is not None
+            and binding.import_source.rpartition(":")[2] == target.name
+        )
         for occurrence in lexical.occurrences:
-            if occurrence.name != target.name:
+            if occurrence.name not in spellings:
                 continue
             candidate = symbol_at(db, root, path, occurrence.range.start)
             if candidate != target:
