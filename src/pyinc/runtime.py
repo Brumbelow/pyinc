@@ -652,6 +652,63 @@ def _scan_reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
     return tuple(sorted(offenses))
 
 
+_IMPORT_NAME_OPCODE = dis.opmap["IMPORT_NAME"]
+
+
+def _refused_import_statements(code: CodeType) -> tuple[str, ...]:
+    """The import statements in *code*, and in code nested in it, that a fold refuses.
+
+    A statement is refused when it is relative or its module's top-level name
+    is not a standard-library one. Capture fingerprinting folds the names a
+    code object reads. It never sees the module an import statement binds in
+    that code, so a change to the module would move no identity. A
+    standard-library module arrives with the interpreter, whose build every
+    fingerprint folds. Each statement is spelled as source, without its alias.
+
+    Results are cached on the code object, as the reflective scan's are.
+    """
+
+    try:
+        return _cached_refused_import_statements(code)
+    except TypeError:
+        return _scan_refused_import_statements(code)
+
+
+@functools.lru_cache(maxsize=2048)
+def _cached_refused_import_statements(code: CodeType) -> tuple[str, ...]:
+    return _scan_refused_import_statements(code)
+
+
+def _scan_refused_import_statements(code: CodeType) -> tuple[str, ...]:
+    statements: list[str] = []
+    for item in _walk_reflective_code(code):
+        if _IMPORT_NAME_OPCODE not in item.co_code[::2]:
+            continue
+        # The compiler emits the level and the from-list as the two loads
+        # right before IMPORT_NAME, on every supported interpreter.
+        instructions = [
+            instruction
+            for instruction in dis.get_instructions(item)
+            if instruction.opname != "EXTENDED_ARG"
+        ]
+        for index, instruction in enumerate(instructions):
+            if instruction.opname != "IMPORT_NAME":
+                continue
+            name = str(instruction.argval)
+            level = instructions[index - 2].argval if index >= 2 else None
+            names = instructions[index - 1].argval if index >= 1 else None
+            if level == 0 and name.partition(".")[0] in sys.stdlib_module_names:
+                continue
+            # A level that is not a plain int is a shape no supported
+            # compiler emits. It is refused as written, never assumed absolute.
+            module = "." * level + name if type(level) is int else name
+            if isinstance(names, tuple) and names:
+                statements.append(f"from {module} import {', '.join(map(str, names))}")
+            else:
+                statements.append(f"import {module}")
+    return tuple(dict.fromkeys(statements))
+
+
 def _canonical_record_key(entry: dict[str, Any]) -> tuple[str, str, str, str]:
     """Stable, total sort key for a manifest record, independent of dict order."""
     return (
@@ -6018,6 +6075,30 @@ class Database:
                 "set before the first db.get()."
             )
 
+    @staticmethod
+    def _reject_body_imports(fn: FunctionType) -> None:
+        """Refuse a relative or non-standard-library import statement in *fn*'s code.
+
+        Every fold of a function's code calls this: a query body, a function
+        folded into its identity, a resource method, an annotation evaluator,
+        and their nested code. A function the runtime build pins is left
+        alone, as its nested code is.
+        """
+
+        statements = _refused_import_statements(fn.__code__)
+        if not statements or Database._is_runtime_pinned_function(fn):
+            return
+        raise UnsupportedValueError(
+            f"Function {fn.__module__}.{fn.__qualname__} runs "
+            f"{', '.join(repr(statement) for statement in statements)} in code "
+            "that is folded into query or resource identity. A module imported "
+            "there is outside identity, so a change to it would leave a stale "
+            "answer. Move the import to module scope, where it is captured. A "
+            "standard-library import may stay. Run "
+            "pyinc.explain_query_captures(...) to inspect the capture set "
+            "before the first db.get()."
+        )
+
     def _function_definition_payload(
         self, fn: FunctionType, seen_functions: builtins.set[int]
     ) -> Any:
@@ -6028,6 +6109,7 @@ class Database:
         if guarded is not None:
             return guarded
         self._reject_reflective_namespace_reads(fn)
+        self._reject_body_imports(fn)
         fn_id = id(fn)
         if fn_id in seen_functions:
             return ("recursive-function", fn.__module__, fn.__qualname__)
@@ -6152,8 +6234,10 @@ class Database:
         # The third route that folds a Python function's code. It makes the
         # same static assumption as the other two: the names below are resolved
         # against the evaluator's globals. A reflective read reaches state none
-        # of them names, so it is refused here as well.
+        # of them names, so it is refused here as well, and so is an import
+        # statement whose module none of them names.
         self._reject_reflective_namespace_reads(evaluator)
+        self._reject_body_imports(evaluator)
         evaluator_id = id(evaluator)
         if evaluator_id in active_ids:
             return ("recursive-annotation-evaluator", evaluator.__qualname__)
@@ -8285,6 +8369,7 @@ class Database:
         """
 
         self._reject_reflective_namespace_reads(function)
+        self._reject_body_imports(function)
         defining_module = sys.modules.get(function.__module__)
         if defining_module is None:
             raise UnsupportedValueError(

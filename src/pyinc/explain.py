@@ -236,7 +236,8 @@ def _classify_handle_state(query: Any) -> list[CaptureInfo]:
 
 def explain_query_captures(fn_or_query: Any) -> tuple[CaptureInfo, ...]:
     from .core import Query
-    from .runtime import _reflective_namespace_offenses
+    from .errors import UnsupportedValueError
+    from .runtime import Database, _reflective_namespace_offenses, _refused_import_statements
 
     handle = fn_or_query if isinstance(fn_or_query, Query) else None
     target = handle.fn if handle is not None else fn_or_query
@@ -263,12 +264,25 @@ def explain_query_captures(fn_or_query: Any) -> tuple[CaptureInfo, ...]:
                 ),
             )
         )
+    # The body's own import statements, with the kernel's refusal. A helper's
+    # are reported on the capture that folds it, by the fold itself.
+    try:
+        Database._reject_body_imports(target)
+    except UnsupportedValueError as exc:
+        results.append(
+            CaptureInfo(
+                name=f"import[{', '.join(_refused_import_statements(target.__code__))}]",
+                origin="code",
+                type_name="code",
+                accepted=False,
+                kind="rejected",
+                rejection_reason=str(exc),
+            )
+        )
     for index, value in enumerate(target.__defaults__ or ()):
         results.append(_classify_capture(f"default[{index}]", value, "default", owner=target))
     for default_name, value in sorted((target.__kwdefaults__ or {}).items()):
         results.append(_classify_capture(f"kwdefault[{default_name}]", value, "kwdefault", owner=target))
-
-    from .runtime import Database
 
     closure_vars = Database._closure_vars(target)
     for capture_name, value in sorted(closure_vars.nonlocals.items()):
