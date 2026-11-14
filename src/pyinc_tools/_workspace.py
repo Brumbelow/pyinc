@@ -57,7 +57,10 @@ SESSION_CLOSED_MESSAGE = "WorkspaceSession is closed."
 # and NotADirectoryError. Both mean absence on both platforms, so neither may
 # be reported as an unsafe path.
 _MISSING_PATH_ERRORS = (FileNotFoundError, NotADirectoryError)
-_REQUIREMENTS_REFERENCE = re.compile(r"^(?:-r|--requirement|-c|--constraint)\s+(.+)$")
+# pip reads an include option with optparse, which takes the target after
+# whitespace or "=", or attached to a short option, as in "-rbase.txt". The
+# requirements integration reads the same forms.
+_REQUIREMENTS_REFERENCE = re.compile(r"^(?:-[rc]\s*|--(?:requirement|constraint)(?:\s+|=))(.+)$")
 
 
 class WorkspaceTooLargeError(ValueError):

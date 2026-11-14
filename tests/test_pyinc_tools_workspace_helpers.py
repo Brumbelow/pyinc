@@ -6,6 +6,7 @@ import hashlib
 import io
 import os
 import shutil
+import site
 import tempfile
 import threading
 import tokenize
@@ -19,6 +20,8 @@ from _rendezvous import Rendezvous, run_in_threads
 import pyinc_tools._workspace as workspace
 import pyinc_tools.cli as cli
 import pyinc_tools.lsp as lsp_module
+from pyinc import Database
+from pyinc.integrations.requirements_txt import requirements_analysis
 from pyinc_tools._jsonrpc import read_message
 from pyinc_tools.lsp import LanguageServer
 from pyinc_tools.session import WorkspaceSession
@@ -553,6 +556,100 @@ def test_requirements_reference_paths_handles_missing_directory_and_invalid_utf8
     assert (
         workspace._requirements_reference_paths(root, frozenset(), ("requirements.txt",)) == set()
     )
+
+
+# pip reads an include option with optparse, which takes the target after
+# whitespace or "=", or attached to a short option.
+_REQUIREMENTS_INCLUDE_FORMS = (
+    "-r base.txt",
+    "-rbase.txt",
+    "--requirement base.txt",
+    "--requirement=base.txt",
+    "-c base.txt",
+    "-cbase.txt",
+    "--constraint base.txt",
+    "--constraint=base.txt",
+)
+
+
+@pytest.mark.parametrize(
+    ("line", "includes"),
+    [
+        *((form, True) for form in _REQUIREMENTS_INCLUDE_FORMS),
+        ("-r\tbase.txt", True),
+        ("-rbase.txt # pinned", True),
+        ("--requirementbase.txt", False),
+        ("--requirements=base.txt", False),
+        ("-r", False),
+    ],
+)
+def test_requirements_reference_paths_agree_with_the_requirements_integration(
+    tmp_path: Path, line: str, includes: bool
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    base = root / "base.txt"
+    base.write_text("package\n", encoding="utf-8")
+    entrypoint = root / "requirements.txt"
+    entrypoint.write_text(f"{line}\n", encoding="utf-8")
+
+    mirrored = workspace._requirements_reference_paths(root, frozenset(), ())
+    parsed = {
+        Path(os.path.abspath(root / reference.path))
+        for reference in requirements_analysis(Database(), entrypoint).file_references
+    }
+
+    assert mirrored == parsed == ({base} if includes else set())
+
+
+@pytest.mark.parametrize("line", _REQUIREMENTS_INCLUDE_FORMS)
+def test_mirror_copies_a_requirements_include_in_each_form(tmp_path: Path, line: str) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "base.txt").write_text("package\n", encoding="utf-8")
+    (root / "requirements.txt").write_text(f"{line}\n", encoding="utf-8")
+
+    with WorkspaceSession(root) as session:
+        assert _mirrored_files(Path(session.mirror_root)) == {
+            "a.py",
+            "base.txt",
+            "requirements.txt",
+        }
+
+
+def test_an_attached_requirements_include_declares_its_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One installed distribution, `fakepkg`, that provides the module `fakepkg`.
+    dist_info = tmp_path / "site-packages" / "fakepkg-1.0.dist-info"
+    dist_info.mkdir(parents=True)
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: fakepkg\nVersion: 1.0\n", encoding="utf-8"
+    )
+    (dist_info / "top_level.txt").write_text("fakepkg\n", encoding="utf-8")
+    site_dir = str(dist_info.parent)
+    monkeypatch.setattr(site, "getsitepackages", lambda *args, **kwargs: [site_dir])
+    monkeypatch.setattr(site, "getusersitepackages", lambda *args, **kwargs: site_dir)
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.py").write_text("import fakepkg\n\nfakepkg.run()\n", encoding="utf-8")
+    (root / "base.txt").write_text("fakepkg\n", encoding="utf-8")
+
+    diagnostics = {}
+    for line in ("-r base.txt", "-rbase.txt", "--requirement=base.txt"):
+        (root / "requirements.txt").write_text(f"{line}\n", encoding="utf-8")
+        with WorkspaceSession(root) as session:
+            diagnostics[line] = [
+                (diagnostic.code, diagnostic.message)
+                for diagnostic in session.analyze_workspace().diagnostics
+            ]
+
+    assert diagnostics == {
+        "-r base.txt": [],
+        "-rbase.txt": [],
+        "--requirement=base.txt": [],
+    }
 
 
 def test_workspace_files_include_relevant_and_referenced_files_only(tmp_path: Path) -> None:
