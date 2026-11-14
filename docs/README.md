@@ -37,12 +37,16 @@ results to disk. Each document below has one job.
 One distribution ships three top-level typed packages. The stable integration
 surface is a subpackage of `pyinc`.
 
+Semantic versioning covers only what `pyinc` and `pyinc.integrations` export.
+`pyinc_tools` and `pyinc_codegen` are feature-frozen: their behavior changes
+only to fix a defect.
+
 | Package | Stability | Owns | Contract |
 |---|---|---|---|
 | `pyinc` | Stable | The query kernel: `Database`, `Input`, `@query`, `Resource` and the built-in resources, `freeze`/`thaw` and the snapshot types, `ValueAdapter`, inspection and push observers, artifact stores and checkpoints, and the `@action` output layer. Domain-agnostic: language, schema, and editor concepts live in the other packages. | [Kernel](kernel-contract.md), [Action](action-contract.md) |
 | `pyinc.integrations` | Stable | Frozen result types and high-level entrypoints for Python source, TOML/JSON/XML/CSV/env configuration, requirements and installed packages, dependency checks, deep module resolution, scopes and symbols, and notebooks, plus the shared source geometry (`SourcePosition`, `SourceRange`, `DocumentMap`). Payload queries and decode helpers stay module-local. | [Integration](integration-contract.md) |
-| `pyinc_tools` | Unstable | `pyinc-tools analyze`, the polling watcher and mirror workspaces, `WorkspaceSession` as the lock-owning façade, protocol-position conversion, and the stdio LSP/JSON-RPC server. | [Tools guide](pyinc-tools-guide.md), [LSP](lsp-reference.md) |
-| `pyinc_codegen` | Unstable | JSON Schema analysis and typed-Python generation through the public query and action APIs. | [Codegen guide](codegen-guide.md) |
+| `pyinc_tools` | Feature-frozen | `pyinc-tools analyze`, the polling watcher and mirror workspaces, `WorkspaceSession` as the lock-owning façade, protocol-position conversion, and the stdio LSP/JSON-RPC server. | [Tools guide](pyinc-tools-guide.md), [LSP](lsp-reference.md) |
+| `pyinc_codegen` | Feature-frozen | JSON Schema analysis and typed-Python generation through the public query and action APIs. | [Codegen guide](codegen-guide.md) |
 
 Both consumer packages use only public `pyinc` and `pyinc.integrations` names.
 If a consumer needs something that only a kernel internal provides, widen the

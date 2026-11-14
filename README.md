@@ -25,6 +25,18 @@ CPython minor release.
 python -m pip install pyinc
 ```
 
+## Status
+
+pyinc is feature-complete. No new features are planned. Bug fixes and
+soundness fixes are welcome as pull requests.
+[CONTRIBUTING.md](https://github.com/Brumbelow/pyinc/blob/main/CONTRIBUTING.md)
+has the setup and the checks. No response time is promised. The supported
+Python versions are 3.11 to 3.14, plus the free-threaded 3.14t build.
+
+Semantic versioning covers only what `pyinc` and `pyinc.integrations` export.
+`pyinc_tools` and `pyinc_codegen` are feature-frozen: their behavior changes
+only to fix a defect.
+
 ## Quick start
 
 ```python docs-check
@@ -73,12 +85,14 @@ the clips, the full provenance, and the deterministic work counts.
 - [Documentation index](https://github.com/Brumbelow/pyinc/blob/main/docs/README.md): every document, the package map, and the authoring and codegen guides.
 - [Releases and verification](https://github.com/Brumbelow/pyinc/blob/main/docs/releases.md): what the release workflow checks, trusted publishing, and checking a download.
 
-One distribution ships three top-level typed packages:
+One distribution ships three top-level typed packages: `pyinc`, `pyinc_tools`,
+and `pyinc_codegen`. The stable integration surface, `pyinc.integrations`, is a
+subpackage of `pyinc`.
 
 - `pyinc`: the stable query kernel, resources, snapshots, artifact stores, and declared-output actions
 - `pyinc.integrations`: stable analysis results and entrypoints for Python source, configuration, dependencies, symbols, and notebooks
-- `pyinc_tools` (unstable): `pyinc-tools analyze`, a polling watcher, `WorkspaceSession`, and a stdio LSP server
-- `pyinc_codegen` (unstable): JSON Schema to typed Python generation
+- `pyinc_tools` (feature-frozen): `pyinc-tools analyze`, a polling watcher, `WorkspaceSession`, and a stdio LSP server
+- `pyinc_codegen` (feature-frozen): JSON Schema to typed Python generation
 
 ## Development
 

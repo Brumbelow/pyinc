@@ -878,7 +878,8 @@ node in a report carries four decision fields:
 The semver contract this document defines covers everything `pyinc` exports,
 and only that. The package is PEP 561 typed. `pyinc.integrations` states its
 own stable surface in [integration-contract.md](integration-contract.md).
-`pyinc_tools` and `pyinc_codegen` are unstable (see
+`pyinc_tools` and `pyinc_codegen` are feature-frozen: their behavior changes
+only to fix a defect. This contract does not cover them (see
 [SECURITY.md](../SECURITY.md)). `scripts/check_docs.py` compares these tables
 against `pyinc.__all__` in both directions.
 

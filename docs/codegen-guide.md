@@ -11,7 +11,8 @@ It is stdlib-only and uses only public `pyinc` names (`@query`,
 `BinaryFileResource`, `Output` / `@action`). JSON-Schema concepts stay in
 `pyinc_codegen`, outside the kernel. See the [package map](README.md#packages).
 
-`pyinc_codegen` is **unstable** and outside the semantic-versioning promise.
+`pyinc_codegen` is **feature-frozen**: its behavior changes only to fix a
+defect. It is outside the semantic-versioning promise.
 Its exported names and generated-output shape may change in any release.
 [SECURITY.md](../SECURITY.md) states what the promise covers.
 

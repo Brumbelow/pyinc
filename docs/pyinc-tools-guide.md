@@ -4,7 +4,8 @@
 in the `pyinc` distribution. It consumes the stable `pyinc.integrations` API.
 LSP and filesystem-watcher behavior lives here, outside the kernel.
 
-`pyinc_tools` is **unstable** and outside the semantic-versioning promise.
+`pyinc_tools` is **feature-frozen**: its behavior changes only to fix a defect.
+It is outside the semantic-versioning promise.
 [SECURITY.md](../SECURITY.md) states what that promise covers.
 
 ## Install and verify
