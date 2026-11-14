@@ -10108,3 +10108,151 @@ def test_submodule_and_alias_imports_keep_their_diagnostics(tmp_path: Path) -> N
         _apply_code_action_edits(broken, broken_actions[0].edits)
         == "from m import SEP as _sep\n\nprint(_sep)\n"
     )
+
+
+def _workspace_diagnostics(
+    result: pyinc_tools.WorkspaceAnalysisResult,
+) -> list[AnalysisDiagnostic]:
+    return [
+        *result.diagnostics,
+        *(diagnostic for file in result.files for diagnostic in file.diagnostics),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("specs", "expected"),
+    [
+        (("1.0", "2.0", "1.0"), []),
+        (
+            ("2.0", "3.0", "2.0"),
+            [
+                ("dependency-version_mismatch", 0, "'fakepkg' with constraint '>=2.0'"),
+                ("dependency-version_mismatch", 1, "'otherpkg' with constraint '==3.0'"),
+                ("dependency-version_mismatch", 3, "'markedpkg' with constraint '>=2.0'"),
+            ],
+        ),
+    ],
+    ids=["matching", "not-matching"],
+)
+def test_requirement_comment_and_options_are_not_part_of_its_specifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    specs: tuple[str, str, str],
+    expected: list[tuple[str, int, str]],
+) -> None:
+    # pip ends a requirement at an inline comment or at its first option, and
+    # pip-compile writes each hash on a continuation line. fakepkg 1.0,
+    # otherpkg 2.0 and markedpkg 1.0 are installed.
+    site_dir = tmp_path / "site-packages"
+    _install_fake_distribution(monkeypatch, site_dir)
+    for name, version in (("otherpkg", "2.0"), ("markedpkg", "1.0")):
+        _write(
+            site_dir / f"{name}-{version}.dist-info" / "METADATA",
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+        )
+    root = tmp_path / "workspace"
+    _write(root / "app.py", "x = 1\n")
+    _write(
+        root / "requirements.txt",
+        f"fakepkg>={specs[0]}  # the installer\n"
+        f"otherpkg=={specs[1]} \\\n"
+        f"    --hash=sha256:{'a' * 64}\n"
+        f'markedpkg>={specs[2]} ; python_version >= "3"\n',
+    )
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_workspace()
+
+    diagnostics = _workspace_diagnostics(result)
+    assert {Path(d.path).name for d in diagnostics} <= {"requirements.txt"}
+    assert [
+        (d.code, d.range.start.line if d.range else None, d.message.split(" does not match")[0])
+        for d in diagnostics
+    ] == [(code, line, f"Declared dependency {constraint}") for code, line, constraint in expected]
+
+
+def test_requirement_from_an_included_file_is_reported_at_a_line_that_exists(
+    tmp_path: Path,
+) -> None:
+    # A requirement record does not name the file it came from. One the root
+    # file lists keeps its own line, and one only an included file lists is
+    # reported at the start of the root file. earlypkg sits on a line the root
+    # file also has, and basepkg on a line past the end of the root file.
+    root = tmp_path / "workspace"
+    _write(root / "app.py", "x = 1\n")
+    _write(root / "requirements.txt", "-r base.txt\nrootpkg\n")
+    _write(root / "base.txt", "# base requirements\nearlypkg\n# 3\n# 4\nbasepkg==1.0\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_workspace()
+
+    diagnostics = _workspace_diagnostics(result)
+    assert [
+        (
+            Path(d.path).name,
+            d.code,
+            d.message,
+            (d.range.start.line, d.range.start.character) if d.range else None,
+        )
+        for d in diagnostics
+    ] == [
+        (
+            "requirements.txt",
+            "dependency-missing",
+            "Declared dependency 'earlypkg' is not installed.",
+            (0, 0),
+        ),
+        (
+            "requirements.txt",
+            "dependency-missing",
+            "Declared dependency 'basepkg' is not installed.",
+            (0, 0),
+        ),
+        (
+            "requirements.txt",
+            "dependency-missing",
+            "Declared dependency 'rootpkg' is not installed.",
+            (1, 0),
+        ),
+    ]
+    for diagnostic in diagnostics:
+        assert diagnostic.range is not None
+        lines = Path(diagnostic.path).read_text(encoding="utf-8").splitlines()
+        assert diagnostic.range.start.line < len(lines)
+
+
+def test_language_server_publishes_requirements_diagnostics_from_an_included_file(
+    tmp_path: Path,
+) -> None:
+    # A range past the end of requirements.txt could not be converted for the
+    # client, so the publish for that file was skipped with all its diagnostics.
+    root = tmp_path / "workspace"
+    _write(root / "app.py", "x = 1\n")
+    _write(root / "requirements.txt", "-r base.txt\nrootpkg\n")
+    _write(root / "base.txt", "# base requirements\n# 2\n# 3\n# 4\nbasepkg==1.0\n")
+    out = io.BytesIO()
+    server = LanguageServer(in_stream=io.BytesIO(), out_stream=out, default_root=str(root))
+    try:
+        server._handle_request(
+            "initialize",
+            {"rootUri": root.as_uri(), "initializationOptions": {"pyinc.watcher.enabled": False}},
+        )
+        server._handle_message({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        assert server.wait_idle(120)
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    replay = io.BytesIO(out.getvalue())
+    messages = []
+    while (message := read_message(replay)) is not None:
+        messages.append(message)
+    published = {
+        message["params"]["uri"]: message["params"]["diagnostics"]
+        for message in messages
+        if message.get("method") == "textDocument/publishDiagnostics"
+    }
+    assert [
+        (item["code"], item["range"]["start"]["line"])
+        for item in published[(root / "requirements.txt").as_uri()]
+    ] == [("dependency-missing", 0), ("dependency-missing", 1)]

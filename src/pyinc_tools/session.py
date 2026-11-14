@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import dataclasses
 import keyword
 import os
 import tempfile
@@ -44,6 +45,7 @@ from pyinc.integrations import (
     module_symbol_table,
     request_inputs_changed,
     request_scope,
+    requirements_analysis,
     scope_tree,
     workspace_analysis,
     workspace_config_analysis,
@@ -3922,12 +3924,34 @@ class WorkspaceSession:
             # plus the target as its version text. An editable line keeps its
             # path or URL as the name. Neither names a distribution, so the
             # installed index has nothing to look up for it.
-            declared.extend(
-                requirement.raw_line
-                for requirement in requirements.requirements
-                if not requirement.is_editable
-                and requirement.version_spec != f"@ {requirement.name}"
-            )
+            #
+            # The check reads a PEP 508 string, so the entry is built from the
+            # parsed fields. The line as written can still hold an inline
+            # comment or pip options such as `--hash`, and the check would read
+            # them as part of the version specifier.
+            for requirement in requirements.requirements:
+                if requirement.is_editable or requirement.version_spec == f"@ {requirement.name}":
+                    continue
+                extras = f"[{','.join(requirement.extras)}]" if requirement.extras else ""
+                markers = f" ; {requirement.markers}" if requirement.markers else ""
+                declared.append(f"{requirement.name}{extras}{requirement.version_spec}{markers}")
+            # A record does not name the file it came from. The root file's
+            # record for a name replaces an included file's, so a name the root
+            # file lists keeps its range. A name only an included file lists has
+            # a line number in that file, so it is placed at the start of the
+            # root file.
+            if requirements.requirements:
+                root_file = requirements_analysis(self.db, requirements.path)
+                root_names = {requirement.name for requirement in root_file.requirements}
+                requirements = dataclasses.replace(
+                    requirements,
+                    requirements=tuple(
+                        requirement
+                        if requirement.name in root_names
+                        else dataclasses.replace(requirement, range=_START_OF_FILE)
+                        for requirement in requirements.requirements
+                    ),
+                )
 
         return _DependencyInputs(
             config=self._remap_config_analysis(config),
