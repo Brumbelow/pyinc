@@ -24,7 +24,13 @@ from _rendezvous import Rendezvous, run_in_threads
 
 import pyinc_tools.session as session_module
 from pyinc import Database, query
-from pyinc.integrations import _decoding, once_per_request, request_inputs_changed, request_scope
+from pyinc.integrations import (
+    _decoding,
+    once_per_request,
+    request_inputs_changed,
+    request_scope,
+    scope_resolution,
+)
 from pyinc.integrations.python_source import workspace_analysis
 from pyinc.integrations.scope_resolution import _decode_scope_tree, scope_tree
 from pyinc.integrations.symbol_resolution import (
@@ -253,6 +259,36 @@ def test_entrypoints_answer_once_per_session_request(
         # imports, which asks for the same tables again; within one request they
         # are answered once each.
         assert counter["n"] == 3
+
+
+def test_scope_tree_canonicalizes_each_path_once_per_session_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_workspace(tmp_path)
+    resolved_paths = scope_resolution._RESOLVED_PATHS
+    read = type(resolved_paths).read.__code__
+    canonicalized: list[str] = []
+
+    def tracer(frame: FrameType, event: str, arg: Any) -> _TraceFunc:
+        if (
+            event == "call"
+            and frame.f_code is read
+            and frame.f_locals.get("self") is resolved_paths
+        ):
+            canonicalized.append(frame.f_locals["key"])
+        return tracer
+
+    with WorkspaceSession(tmp_path) as session:
+        session.analyze_workspace()
+        monkeypatch.setattr(_sys_trace, "current", tracer)
+        session.analyze_workspace()
+        monkeypatch.undo()
+
+    # The request asks for a file's scope tree once per import it resolves.
+    # Each of those calls names the same path, and the path is canonicalized
+    # through the tracked resource once.
+    assert len(set(canonicalized)) == 3
+    assert len(canonicalized) == 3
 
 
 def test_entrypoints_outside_a_session_still_see_edits(tmp_path: Path) -> None:

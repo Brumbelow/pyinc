@@ -1088,9 +1088,15 @@ def scope_tree(db: Database, path: str | os.PathLike[str]) -> ScopeTree:
     # canonicalized. The bare call raises on some interpreters and returns a
     # path that is still a link on others. Such a path names no source file,
     # so this layer raises its own error for it.
-    normalized = _RESOLVED_PATHS.read(db, os.fspath(path))
+    # A request names the same file many times, once per import it resolves.
+    # The resource gives one answer for the whole request, so the read is made
+    # once per path and request.
+    given = os.fspath(path)
+    normalized = once_per_request(
+        db, "scope_tree_path", (given,), lambda: _RESOLVED_PATHS.read(db, given)
+    )
     if normalized is None:
-        raise UnsupportedValueError(f"Path cannot be resolved: {os.fspath(path)}")
+        raise UnsupportedValueError(f"Path cannot be resolved: {given}")
     return once_per_request(
         db, "scope_tree", (normalized,), lambda: _scope_tree(db, normalized)
     )
