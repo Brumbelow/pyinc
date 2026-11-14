@@ -33,10 +33,16 @@ python -m pyinc_tools --version
 Exit statuses:
 
 - `0`: success.
-- `1`: analysis or workspace failure. The analyzer could not run.
+- `1`: the command did not finish. The root or `--path` is missing or unsafe,
+  the workspace holds too many files, analysis failed, or the reader closed
+  the output pipe. A closed pipe ends the command without a message.
 - `2`: invalid command-line usage.
 - `3`: the `--fail-on` diagnostic gate tripped. The analyzer ran and found
   something.
+
+`pyinc-tools lsp` exits `0` after `shutdown` and `exit` or at the end of its
+input, `1` after an `exit` without `shutdown` or on input it cannot split into
+messages, and `143` when SIGTERM ends it.
 
 ## Analyze a workspace
 
@@ -53,6 +59,25 @@ larger values give more readable JSON.
 
 `--path` must resolve inside the workspace. Invalid roots, escaping paths, and
 unsafe filesystem links fail, and analysis stays inside the workspace.
+`--path` limits the output to one file. The whole workspace is still mirrored
+and indexed, because import resolution and the dependency check read every
+module. A `--path` that is not an existing file exits `1`. A `--path` that
+names a file the mirror does not copy, such as a non-Python file other than
+the root manifests or a file under a skipped directory, prints a result with a
+null `module`, null `symbols`, and no diagnostics.
+
+A workspace may hold at most 1,000 Python and manifest files, and a larger one
+exits `1`. `--max-files N` raises the limit. It takes an integer of at least 1,
+and the refusal message names it.
+
+The root sets both the module names and where `pyproject.toml` and
+`requirements.txt` are read. Module names are paths relative to the root, and
+the two manifests are read only at the root. In a src layout, the project root
+reads the manifests but names the package `src.mypkg`, so `import mypkg` does
+not resolve to the workspace. The `src` directory as root names it `mypkg` but
+holds neither manifest, so no dependency diagnostics appear, and files outside
+`src` are not analyzed. Installed imports resolve against the interpreter that
+runs `pyinc-tools`: its site-packages directories and the user site directory.
 
 ### Report diagnostics and gate a CI job
 
@@ -64,12 +89,12 @@ pyinc-tools analyze /path/to/workspace --format text
 pyinc-tools analyze /path/to/workspace --diagnostics-only
 ```
 
-Text lines are `path:line:col: severity code message`. Line and column are
-1-based for display, converted from the zero-based source geometry. A
-diagnostic without a range, such as one for a file that cannot be decoded,
-keeps its `path:` prefix and omits the position. Diagnostics are sorted by
-location, with rangeless ones first in each file, so output is stable across
-runs. A workspace with no diagnostics prints nothing.
+Text lines are `path:line:col: severity code message`, and the path is
+absolute. Line and column are 1-based for display, converted from the
+zero-based source geometry. A diagnostic without a range, such as one for a
+file that cannot be decoded, keeps its `path:` prefix and omits the position.
+Diagnostics are sorted by location, with rangeless ones first in each file, so
+output is stable across runs. A workspace with no diagnostics prints nothing.
 
 `--fail-on` turns the run into a gate. It exits `3` when any diagnostic is at
 or above the given severity. The threshold is inclusive, so
@@ -85,6 +110,40 @@ upgrade of `pyinc-tools` keeps a green pipeline green until you opt in.
 Combining `--fail-on` with `--watch` is a usage error, because watch mode runs
 until it is interrupted.
 
+### Diagnostic codes
+
+The analyzer reports these codes, and the LSP server publishes them with the
+same `code` and `source`.
+
+| Code | Severity | Source | Meaning |
+|---|---|---|---|
+| `syntax-error` | error | `pyinc.python_source` | The file does not parse, or nests too deeply to parse. |
+| `source-decode-error` | error | `pyinc.python_source` | The file does not decode with its BOM or encoding declaration. |
+| `missing-import` | error | `pyinc.python_source` | The import names no workspace module, standard-library module, or installed package. |
+| `ambiguous-import` | warning | `pyinc.python_source` | More than one workspace file could provide the module. |
+| `unresolved-symbol` | error | `pyinc.symbol_resolution` | A `from` import names something its workspace module does not define. |
+| `ambiguous-symbol` | warning | `pyinc.symbol_resolution` | A `from` import names something with more than one possible definition. |
+| `unused-import` | hint | `pyinc.symbol_resolution` | A workspace `from ... import ...` binding is never read in its module. |
+| `undeclared-import` | warning | `pyinc.dependency_check` | The import comes from an installed distribution the manifests do not declare. |
+| `dependency-missing` | warning | `pyinc.dependency_check` | A declared dependency is not installed. |
+| `dependency-version_mismatch` | warning | `pyinc.dependency_check` | The installed version does not satisfy the declared constraint. |
+| `dependency-ambiguous` | warning | `pyinc.dependency_check` | The declared constraint cannot be evaluated. |
+| `unparseable-line` | error | `pyinc.requirements_txt` | A requirements line is not a requirement, include, or option the parser reads. |
+| `requirements-decode-error` | error | `pyinc.requirements_txt` | A requirements file is not UTF-8. |
+| `missing-requirements-file` | error | `pyinc.requirements_txt` | An `-r` include names a file that does not exist. |
+| `cycle` | error | `pyinc.requirements_txt` | `-r` includes form a loop. |
+| `error` | error | `pyinc.requirements_txt` | An `-r` include resolves outside the workspace root. |
+
+No code reports `information`. `undeclared-import` is reported only when the
+root holds a `requirements.txt` or a `pyproject.toml` with a `[project]`
+table. A `[project]` table with `dynamic = ["dependencies"]` and no
+`requirements.txt` lists no dependencies, so each installed import gets the
+diagnostic unless an optional dependency group names it. `unused-import`
+checks only `from` imports of workspace modules, and never in an `__init__.py`
+file. It skips a file that does not parse, a `from m import x as x`
+re-export, a name in the module's `__all__`, and a name another workspace
+module imports from it.
+
 ### Watch mode
 
 ```console
@@ -94,9 +153,17 @@ pyinc-tools analyze /path/to/workspace --watch --debounce-ms 300 --poll-interval
 
 Watch mode prints the initial analysis. After changed files settle for the
 debounce window, it prints a JSON object with `changed_paths` and a new
-`analysis`. The watcher polls in a daemon thread and exits cleanly on Ctrl-C.
-Polling is the only built-in backend. It uses only the standard library and
-is portable.
+`analysis`. `--debounce-ms` takes an integer of at least 0 and defaults to
+200. `--poll-interval-ms` takes an integer of at least 1 and defaults to half
+the debounce window, but no less than 50. The watcher polls in a daemon
+thread. Ctrl-C ends watch mode with status `0` once the initial analysis has
+printed. Polling is the only built-in backend. It uses only the standard
+library and is portable.
+
+Each poll walks the workspace and reads a file again only when its size or
+modification time changes, so an edit that keeps both is not seen. A path
+whose content on disk equals what the mirror holds is not reported, such as a
+file edited and then restored within the debounce window.
 
 With `--format text`, each batch starts with a `# changed: <paths>` header,
 followed by that run's diagnostic lines. `grep -v '^#'` filters out the
@@ -119,9 +186,10 @@ with WorkspaceSession("/path/to/workspace") as session:
         # Keep the application alive while the watcher is needed.
 ```
 
-Callbacks run on the watcher thread. Keep them short or hand work to a queue.
-You can also call `refresh_paths(...)` from an existing platform watcher. Use
-one of these two paths at a time for a given watcher.
+`start()` polls every 0.5 seconds when `interval_s` is omitted. Callbacks run
+on the watcher thread. Keep them short or hand work to a queue. You can also
+call `refresh_paths(...)` from an existing platform watcher. Use one of these
+two paths at a time for a given watcher.
 
 `start()`, `stop()`, `poll()` and the session's `close()` may be called from
 different threads. Each waits for the others, so a stop or a close that lands
@@ -139,10 +207,21 @@ The server speaks JSON-RPC over stdio. It picks the workspace root in this
 order: the client's `rootUri`, its first workspace folder, its legacy root
 path, then `--root`, then the current directory.
 
+`initialize` fails with a message that says what to do when the root is the
+home directory or a filesystem root, and when the workspace holds more than
+1,000 Python and manifest files. Exclude directories with
+`pyinc.workspace.exclude`, or raise the limit with `pyinc.workspace.maxFiles`.
+
 The server negotiates UTF-8, UTF-16, or UTF-32 positions and uses full-text
-document synchronization. It publishes diagnostics after editor changes and
-external filesystem refreshes. The [LSP reference](lsp-reference.md) has the
-complete method matrix and user-visible limitations.
+document synchronization. It pushes diagnostics. One worker thread analyzes
+the workspace and publishes after `initialized`, open, change, save, close,
+and each built-in watcher refresh. A change that repeats the last text sent
+runs no analysis. Edits that arrive while an analysis runs are analyzed
+together in one run when it ends. A
+`workspace/didChangeWatchedFiles` notification analyzes and publishes on the
+request thread, before the server reads the next message. The
+[LSP reference](lsp-reference.md) has the complete method matrix and
+user-visible limitations.
 
 ### Initialization options
 
@@ -152,18 +231,31 @@ Pass these keys under the LSP `initializationOptions` object:
 |---|---|---|---|
 | `pyinc.watcher.enabled` | boolean | `true` | Starts the built-in polling watcher so external edits refresh diagnostics. |
 | `pyinc.watcher.debounceMs` | integer | `200` | Waits this many milliseconds for a change to settle. |
-| `pyinc.watcher.intervalMs` | number | derived from the debounce | Sets the polling interval in milliseconds. |
+| `pyinc.watcher.intervalMs` | number | `500` | Sets the polling interval in milliseconds. |
 | `pyinc.workspace.exclude` | string array | `[]` | Omits matching workspace-relative glob patterns from the mirror and watcher. |
+| `pyinc.workspace.maxFiles` | integer | `1000` | Refuses a workspace with more Python and manifest files than this. |
 
-If the editor reliably sends `workspace/didChangeWatchedFiles`, disable the
-built-in watcher to avoid duplicate scanning. Identical diagnostic
-publications are deduplicated either way.
+A `pyinc.watcher.debounceMs` or `pyinc.watcher.intervalMs` of the wrong type
+fails initialize with an Invalid params error.
+
+The built-in watcher and `workspace/didChangeWatchedFiles` can run together.
+The watcher skips a path whose disk content equals what the mirror last copied
+from disk, so a change the editor reports first is analyzed once. A file whose
+editor text is in the mirror (after `didOpen` or `didChange`, until `didSave`
+or `didClose`) is analyzed twice, because the editor's report leaves that text
+in place and the watcher still sees the disk change. A
+`workspace/didChangeWatchedFiles` notification always runs an analysis, so a
+change the watcher reports first is analyzed twice. Diagnostics equal to the
+last ones sent for a file are not sent again.
 
 ## Editor setup
 
-Any client that can launch a stdio language server can use `pyinc-tools lsp`.
-Configure it for Python files and choose the workspace root that should define
-module names.
+Neovim and Emacs with Eglot are the documented clients. Configure the client
+for Python files, choose the root as
+[Analyze a workspace](#analyze-a-workspace) describes, and launch the
+`pyinc-tools` installed in the project's environment. `pyinc-tools` can run
+beside a type checker. It covers incremental workspace symbols, navigation,
+and dependency diagnostics, and leaves full static typing to the type checker.
 
 ### Neovim
 
@@ -171,14 +263,21 @@ module names.
 vim.api.nvim_create_autocmd("FileType", {
   pattern = "python",
   callback = function(args)
+    local root = vim.fs.root(args.buf, { "pyproject.toml", ".git" })
+    if root == nil then
+      return
+    end
     vim.lsp.start({
       name = "pyinc-tools",
       cmd = { "pyinc-tools", "lsp" },
-      root_dir = vim.fs.root(args.buf, { "pyproject.toml", ".git" }),
+      root_dir = root,
     })
   end,
 })
 ```
+
+A buffer with no `pyproject.toml` or `.git` above it starts no server, so the
+server never falls back to the editor's working directory.
 
 ### Emacs with Eglot
 
@@ -190,38 +289,45 @@ vim.api.nvim_create_autocmd("FileType", {
 
 ### VS Code
 
-VS Code requires an extension or generic bridge that launches a stdio server.
-Configure that bridge to run:
-
-```text
-pyinc-tools lsp
-```
-
-This release ships without a first-party VS Code extension. `pyinc-tools` can
-run beside a type checker. It covers incremental workspace symbols,
-navigation, and dependency diagnostics, and leaves full static typing to the
-type checker.
+VS Code is untested. It needs an extension or a generic bridge that launches a
+stdio server, and pyinc ships none.
 
 ## Workspace mirror and overlays
 
-`WorkspaceSession` analyzes a temporary mirror of the workspace, so editor
-text stays out of the source tree.
+`WorkspaceSession` analyzes a mirror of the workspace, so editor text stays
+out of the source tree.
 
-1. Construction copies supported Python, configuration, notebook, and root
-   requirements files under the workspace into a temporary directory.
+1. Construction copies the workspace's Python files (`.py`), the root
+   `pyproject.toml`, the root `requirements.txt`, and the files that file
+   includes with `-r` or `-c`, and nothing else. It raises `ValueError` when
+   the workspace holds more than `max_files` of them, 1,000 by default.
 2. `set_overlay(path, text)` replaces the mirror copy only. LSP open and change
    notifications use it.
 3. `refresh_paths(paths)` syncs saved disk changes into files that have no
    active overlay. Polling and watched-file notifications use it.
 4. Results are mapped back to real workspace paths before they reach callers,
    including paths embedded in diagnostic message text.
-5. `close()` stops mutation and removes the temporary mirror.
+5. `close()` stops mutation and removes the mirror.
 
-The mirror also holds the root requirements file's in-workspace include
-closure, even when included files use nonstandard names. The walk skips
-default ignored directory names and configured exclusion globs. File links
-are rejected. Directory links and Windows junctions are skipped. Avoid
-renaming a workspace root while a session is synchronizing it.
+The mirror is a directory on disk under the system temporary directory
+(`tempfile.gettempdir()`). `close()` removes it, and `pyinc-tools lsp` closes
+its session when it ends, including on SIGTERM. A process killed with SIGKILL
+leaves the directory behind, and so does `pyinc-tools analyze` ended by
+SIGTERM.
+
+Requirements includes are followed in every form pip accepts (`-r file`,
+`-rfile`, `--requirement file`, `--requirement=file`, and the same four for
+constraints), through included files too, when they resolve inside the root.
+An included file can have any name. The walk skips version control, cache,
+virtual environment, and installed-package directories, and `dist`. Among them
+are `node_modules`, `.eggs`, `site-packages`, `__pypackages__`, `.tox`, `.nox`,
+any directory that holds a `pyvenv.cfg`, and any name ending in `.egg-info`.
+It also skips paths that match the exclusion globs. A link inside the root is
+skipped wherever the walk meets one: a linked file, a linked directory, a
+Windows junction, a dangling link such as the lock file Emacs writes beside a
+modified buffer, and a linked requirements file. A link whose target lies
+outside the root refuses the workspace. Avoid renaming a workspace root while
+a session is synchronizing it.
 
 All public source ranges are zero-based and end-exclusive. Library positions
 count Unicode code points. The LSP boundary converts them to the encoding
@@ -230,9 +336,9 @@ negotiated with the editor.
 ## Public surface
 
 `pyinc_tools` exports the names in this table and no others. The groups
-describe what each name is for. A later release may regroup them without any
-change a caller can observe. The kind aliases are `Literal[...]` string
-aliases, so their values are plain strings.
+describe what each name is for. The grouping is editorial: every name imports
+from `pyinc_tools` itself, whatever its group. The kind aliases are
+`Literal[...]` string aliases, so their values are plain strings.
 
 | Group | Names |
 |---|---|
@@ -311,10 +417,17 @@ shadowed, outside the workspace, or needs runtime type inference. The
 ### Dependency diagnostics look wrong
 
 Inspect `dependency_check.statuses` and
-`dependency_check.undeclared_imports` in analyzer output. They are the same
-integration results the LSP publishes. Check that the selected root contains
-the expected `pyproject.toml` or `requirements.txt`, and that your source
-files sit outside the excluded paths.
+`dependency_check.undeclared_imports` in analyzer output. `statuses` holds
+each declared dependency, and each status other than `satisfied` is published
+as a `dependency-*` diagnostic. `undeclared_imports` lists each installed
+distribution that an import uses and no manifest declares, once, with one
+import that uses it, even when the root holds no manifest. The
+`undeclared-import` diagnostic needs a manifest, as
+[Diagnostic codes](#diagnostic-codes) states. A requirements line that names
+no distribution, such as a bare path or URL, is not checked against the
+installed packages. Check that the selected root contains the expected
+`pyproject.toml` or `requirements.txt`, and that your source files sit outside
+the excluded paths.
 
 ### Inspect incremental work
 
