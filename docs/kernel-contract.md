@@ -138,6 +138,19 @@ change written into a list, dict, or set the resource holds is refused at the
 read that observes it. A value rebound anywhere else makes the capturing query
 re-fingerprint on every request and execute cold each time.
 
+Each `Database` derives a resource object's identity once and keeps it for up
+to 256 objects, dropping the oldest first. Every later read of that object
+calls `identity()` once and re-checks the rest of what the derivation read. A
+change found there derives the identity again. The check misses what the first
+shape under limitation 5 describes. The memo is keyed by the object and
+holds it alive, so a resource created anew for each read derives its identity
+afresh every time. Keep a resource object at module scope, or otherwise reuse
+it. A module, a class or a function used as a resource is never memoized, and
+neither is an instance whose class has a `__getattr__` or a `__getattribute__`
+other than `object`'s. Nor is a resource whose fold reaches a class pinned by
+its files or a mutable global folded as its data (limitation 5, last shape).
+Its identity is derived on every read.
+
 A resource hook observes the outside world, and only the outside world. The
 interception below is lifted while `probe`, `load`, and `probe_and_load` run,
 but a hook may not read back into the `Database` it is observing for
@@ -193,10 +206,16 @@ refused the same way, wherever it runs:
 The guard sees only reads that go through these names (limitation 1).
 
 Declare every read this mechanism misses (limitation 1) with
-`db.report_untracked_read(reason)` ([Escape Hatches](#escape-hatches)). A
-module imported for the first time inside a query body runs its module-scope
-code inside that query's boundary. A read performed while it initializes is
-treated the same as one written in the query body. Import at module scope.
+`db.report_untracked_read(reason)` ([Escape Hatches](#escape-hatches)). An
+import statement inside a query body is refused before the body runs unless it
+names a standard-library module (condition 3). A standard-library module
+imported there for the first time, or any module first reached through
+`importlib.import_module` or `__import__`, runs its module-scope code inside
+that query's boundary. A read performed while it initializes is treated the
+same as one written in the query body. What a module reads at import time can
+change with the interpreter version: a first `import subprocess` reads
+`os.environ` on 3.14 and nothing the guard sees on 3.11. Import at module
+scope.
 
 ### 3. Deterministic queries
 
@@ -218,6 +237,30 @@ mutable module data or a compiled pattern, is rejected when it is read only
 there. A standard-library function is the exception. Its nested code arrived
 with the interpreter, the build identity pins it, and it is not read.
 
+An import statement in folded code is refused unless it names a
+standard-library module. Folded code is the query function, each function
+folded into its identity, the methods of a resource or class it captures, its
+`eq=` and `cutoff=` policies, and code nested in any of them. The fold reads
+the names that code uses and never the module a statement binds, so a change
+to that module would leave a stale answer. A relative import is refused. An
+absolute one is accepted when the first component of its dotted name is in
+`sys.stdlib_module_names`, so `import os.path` is accepted. The refusal is an
+`UnsupportedValueError` naming the function, the statement and the remedy:
+move the import to module scope, where the module is a capture. A
+`ValueAdapter`'s `freeze` and `thaw` meet it when a checkpoint is saved. Where
+the import sits in a policy, in an adapter, or in a function a folded helper
+reaches through its globals, the error raised names that policy, adapter or
+helper. The refusal is in its `__cause__` chain. A class a folded helper names
+as a global is the exception. Where its method imports a module outside the
+standard library, or calls a function that does, the class is pinned by the
+files that define it and its bases (limitation 5, last shape). The import is
+not refused, and the module it binds stays out of identity. A standard-library
+function is not scanned. A third-party function is, so one that imports
+lazily, or calls a function that does, is refused: `pygments.lex` and
+`pygments.highlight` in pygments 2.21, and `joblib.cpu_count` in joblib 1.6.
+An accepted standard-library import contributes nothing beyond the names the
+code already carries. The module it binds stays out of the fold (limitation 5).
+
 The reflective rule is a conservative static read of the bytecode of the query
 function and of every callable folded into its identity. `globals()`,
 `locals()`, `vars()`, `eval`, `exec`, and a `__globals__` load are always
@@ -233,7 +276,10 @@ each capture with the fold a `Database` with the default adapters gives it, so
 it accepts and refuses the same captures that database's fingerprint does. It
 takes no adapters. A captured resource whose `identity()` only a registered
 `ValueAdapter` can freeze is reported as rejected, where a `Database` created
-with that adapter accepts it.
+with that adapter accepts it. The preview reports an import statement the
+database refuses with the database's message, as an `import[...]` entry for
+the query function and on a capture whose fold reaches one. It does not judge
+`eq=` and `cutoff=` policies.
 
 A query may capture a callable the condition 2 guard replaced. A name bound
 once a `Database` exists (`from os import getcwd`, `from os.path import
@@ -487,8 +533,8 @@ following hold:
 
 Under these conditions, `load_checkpoint(key)` followed by `db.get(query)`
 returns the value a fresh recomputation on the same declared state would
-return in that mode. The one exception is code edited between the runs that
-identity does not fold: the last shape under limitation 5.
+return in that mode. The exceptions are code edited between the runs that
+identity does not fold: the last two shapes under limitation 5.
 
 A checkpoint record warms when every pinned object and every statically
 captured module chain the record depends on is unchanged. A sub-query or
@@ -536,7 +582,7 @@ each class it reaches to its live module binding. Rebinding such a binding, a
 base, a metaclass, or a directly bound body class then refuses loudly instead
 of moving identity.
 
-Four shapes escape this tracking. Route such state through an `Input` or a
+Five shapes escape this tracking. Route such state through an `Input` or a
 `Resource`:
 
 - A chain that lands on a class or a frozen dataclass instance, named directly
@@ -545,7 +591,7 @@ Four shapes escape this tracking. Route such state through an `Input` or a
   memoized one in place. So a fresh `Database` sees `foo.Model.flag = True`,
   and a warm one misses it. When such a class stops being its module's live
   binding, a warm database serves the stored answer while a fresh computation
-  refuses.
+  refuses. Both hold for a resource whose method reaches such a landing.
 - A captured standard-library module folds only the names of the paths read
   off it. The behavior behind them stays out of the fold, so patching a stdlib
   function or class (`json.dumps = other`) goes undetected, warm or fresh. A
@@ -555,16 +601,26 @@ Four shapes escape this tracking. Route such state through an `Input` or a
 - Outside the standard library, a module that stores a process id, an import
   timestamp, or anything derived from them at module scope makes every
   identity that captures it process-varying.
+- A module a body reaches without capturing it stays out of the fold: one a
+  standard-library import statement binds in the body (condition 3), or one
+  reached through `sys.modules[name]`, `importlib.import_module(name)` or
+  `__import__(name)`. What it holds moves no identity, so a warm database
+  serves the stored answer where a fresh computation reads the module as it
+  is. Across a checkpoint (limitation 4), a new process is served the saved
+  value after an edit to a module reached through those three names.
 - A helper function that reads a mutable module global, or reaches one that
-  does, is pinned by its source: the bytes of its module's file, with what
+  does, is pinned by its source. So is a helper that names as a global a class
+  whose method imports a module outside the standard library, or calls a
+  function that does. The pin is the bytes of its module's file, with what
   its globals fold to. Two of those folds stop short. A class whose own fold
-  is refused (one whose method captures a module-level logger, say) is folded
-  as the files that define it and its bases. A mutable global is folded as its
-  data. Code that either one reaches in another module stays out: what a
-  method of such a class calls there, and the methods of objects held in such
-  a global. An edit to that code moves no identity. In one process that is the
-  first shape above. Across a checkpoint (limitation 4) a new process is
-  served the saved value where a fresh computation gives another.
+  is refused (one whose method imports such a module or captures a
+  module-level logger, say) is folded as the files that define it and its
+  bases. A mutable global is folded as its data. Code that either one reaches
+  in another module stays out: the module a method of such a class imports,
+  what it calls there, and the methods of objects held in such a global. An
+  edit to that code moves no identity. In one process that is the first shape
+  above. Across a checkpoint (limitation 4) a new process is served the saved
+  value where a fresh computation gives another.
 
 ### 6. LRU eviction under active dependencies
 
@@ -940,8 +996,8 @@ Inspection and observation:
 | `InspectionNode` | One node in an `inspect`/`explain` report; its decision fields are defined in [Node Record Fields](#node-record-fields). Fields: `label`, `kind`, `changed_at`, `verified_at`, `last_decision`, `last_recompute`, `reason`, `untracked_reasons`, `dependencies`. |
 | `DependencyGraphNode` | One labeled node in the exported dependency graph. Fields: `label`, `kind`, `changed_at`, `verified_at`, `last_decision`, `is_untracked`, `dependency_labels`. |
 | `QueryProfile` | Per-query timing aggregate from `query_profile()`: one execution count with the total, mean, minimum, maximum, and last nanosecond figures. Reuse and backdate counts live on `DatabaseStatistics`. Fields: `query_label`, `execution_count`, `total_ns`, `mean_ns`, `min_ns`, `max_ns`, `last_ns`. |
-| `CaptureInfo` | One entry in an `explain_query_captures` report: a captured name, a reflective namespace read, or one piece of handle state. |
-| `explain_query_captures` | Preview how a query's captures will be classified before first `get`; also reports reflective namespace reads and, given a `Query`, its handle state. |
+| `CaptureInfo` | One entry in an `explain_query_captures` report: a captured name, a reflective namespace read, a refused import statement, or one piece of handle state. |
+| `explain_query_captures` | Preview how a query's captures will be classified before first `get`; also reports reflective namespace reads, refused import statements and, given a `Query`, its handle state. |
 | `Subscription` | Handle returned by `Database.observe`; closes the subscription. |
 | `QueryChangeEvent` | Delivered to observers when a subscribed query's result changes. |
 | `ObserverCallback` | Callback type receiving `QueryChangeEvent`s. |
