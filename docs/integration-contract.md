@@ -49,8 +49,8 @@ holds that lock, the child gets a new lock.
 | Purpose | Snapshot installed distributions and classify top-level import names. |
 | Entrypoints | `installed_packages_analysis`, `resolve_import_name` |
 | Result types | `ImportNameResolution`, `InstalledPackageRef`, `InstalledPackagesAnalysis` |
-| Supported shapes | `.dist-info` metadata, `top_level.txt`, distribution name fallback, `Requires-Dist`, and the running interpreter's stdlib module names. |
-| Key limits | Legacy egg formats, package installation, marker evaluation, and import-loader execution are out of scope. Deep module resolution handles namespace layout, and distribution metadata plays no part in it. |
+| Supported shapes | `.dist-info` metadata, `top_level.txt`, the top-level names in `RECORD`, distribution name fallback, `Requires-Dist`, and the running interpreter's stdlib module names. |
+| Key limits | Legacy egg formats, package installation, marker evaluation, and import-loader execution are out of scope. Deep module resolution handles namespace layout, and distribution metadata plays no part in it. Without `top_level.txt`, a distribution claims the first component of each `RECORD` path that is a package directory, a `.py` module or an extension module. A `RECORD` that names no module or lists a `.pth` file also claims the distribution name, lowercased, with each run of `-`, `_` and `.` replaced by `_`. So an editable install whose `RECORD` lists only a `.pth` keeps the name fallback, and Python source analysis reports an import of any other name from it as missing. |
 
 ## Deep module resolution
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import csv
 import email.policy
+import io
 import os
 import re
 import site
@@ -141,6 +143,54 @@ def _dist_name_to_import_fallback(dist_name: str) -> str:
     return re.sub(r"[-_.]+", "_", dist_name).lower()
 
 
+_EXTENSION_MODULE_SUFFIXES = (".so", ".pyd")
+
+
+def _record_top_level_names(text: str) -> tuple[tuple[str, ...], bool]:
+    """Read the top-level import names a dist-info RECORD lists.
+
+    The first column of each row is a path relative to site-packages. A
+    backslash separates components as a slash does, since a RECORD written on
+    Windows may use either. A path under a directory names that directory
+    when it is an identifier, so a regular or namespace package counts and
+    ``foo.libs`` or a dist-info or data directory does not. A file at the top
+    names its module when it is a ``.py`` file or an extension module.
+    ``__pycache__``, absolute paths and paths with a ``..`` component name
+    nothing. The flag reports a ``.pth`` file, which can put any name on
+    ``sys.path``. A RECORD the csv reader rejects names nothing.
+    """
+
+    names: set[str] = set()
+    lists_pth = False
+    try:
+        rows = list(csv.reader(io.StringIO(text)))
+    except csv.Error:
+        return (), False
+    for row in rows:
+        if not row:
+            continue
+        parts = row[0].replace("\\", "/").split("/")
+        if ".." in parts:
+            continue
+        head = parts[0]
+        if len(parts) > 1:
+            if head.isidentifier() and head != "__pycache__":
+                names.add(head)
+            continue
+        if head.endswith(".pth"):
+            lists_pth = True
+            continue
+        if head.endswith(".py"):
+            module = head[: -len(".py")]
+        elif head.endswith(_EXTENSION_MODULE_SUFFIXES):
+            module = head.split(".", 1)[0]
+        else:
+            continue
+        if module.isidentifier():
+            names.add(module)
+    return tuple(sorted(names)), lists_pth
+
+
 def _metadata_message(text: str) -> Message:
     """Parse metadata while tolerating blank lines between header fields."""
 
@@ -255,8 +305,16 @@ def _package_metadata_payload(
             line.strip() for line in top_level_raw.strip().splitlines() if line.strip()
         )
     else:
-        # Fallback: derive from distribution name
-        top_level_names = (_dist_name_to_import_fallback(name),)
+        # Hatchling, flit and uv_build wheels ship no top_level.txt, so the
+        # names come from what RECORD lists. The distribution name stays a
+        # claim when RECORD names no module or lists a .pth file.
+        record_names, lists_pth = _record_top_level_names(
+            _METADATA.read(db, os.path.join(dist_info_path, "RECORD"))
+        )
+        if record_names and not lists_pth:
+            top_level_names = record_names
+        else:
+            top_level_names = tuple(sorted({*record_names, _dist_name_to_import_fallback(name)}))
 
     return (name, version, top_level_names, requires_dist, summary)
 

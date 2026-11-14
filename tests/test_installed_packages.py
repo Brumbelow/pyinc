@@ -191,7 +191,8 @@ def test_resolve_import_name_unknown(
 def test_top_level_fallback_when_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
-    # Without top_level.txt, the import name falls back to the normalized dist name.
+    # Without top_level.txt or a RECORD, the import name falls back to the
+    # normalized dist name.
     _make_dist_info(site_dir, "My-Package", "1.0.0")
     monkeypatch.setattr(
         "pyinc.integrations.installed_packages._get_site_packages_dirs",
@@ -203,6 +204,180 @@ def test_top_level_fallback_when_missing(tmp_path: Path, monkeypatch: pytest.Mon
     assert len(analysis.packages) == 1
     # Fallback: My-Package → my_package
     assert analysis.packages[0].top_level_names == ("my_package",)
+
+
+# ---------------------------------------------------------------------------
+# Top-level names from RECORD
+# ---------------------------------------------------------------------------
+
+
+def _write_record(dist_info: Path, *rows: str) -> None:
+    """Write a dist-info RECORD holding the given CSV rows, one per line."""
+    (dist_info / "RECORD").write_text("".join(f"{row}\n" for row in rows), encoding="utf-8")
+
+
+def test_record_derives_top_level_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Hatchling, flit and uv_build wheels ship no top_level.txt. Every wheel
+    # has a RECORD, and the first component of each path in it is what the
+    # wheel put at the top of site-packages.
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    dist_info = _make_dist_info(site_dir, "foo-dist", "1.0")
+    _write_record(
+        dist_info,
+        "foo/__init__.py,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0",
+        "foo/bar.py,,",
+        "single.py,,",
+        "_ext.cpython-314-x86_64-linux-gnu.so,,",
+        "_winext.cp314-win_amd64.pyd,,",
+        "nsparent/child/m.py,,",
+        "winpkg\\__init__.py,,",
+        '"quoted/__init__.py",,',
+        "foo.libs/x.so,,",
+        "../../bin/tool,,",
+        "/opt/tool/data.txt,,",
+        "foo_dist-1.0.data/scripts/tool,,",
+        "foo_dist-1.0.dist-info/METADATA,,",
+        "foo_dist-1.0.dist-info/RECORD,,",
+        "__pycache__/single.cpython-314.pyc,,",
+        "README.txt,,",
+    )
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site_dir),),
+    )
+
+    analysis = installed_packages_analysis(Database())
+
+    assert analysis.packages[0].top_level_names == (
+        "_ext",
+        "_winext",
+        "foo",
+        "nsparent",
+        "quoted",
+        "single",
+        "winpkg",
+    )
+
+
+def test_record_with_pth_keeps_dist_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # An editable install lists a .pth file in place of the package, and a .pth
+    # can put any name on sys.path. The normalized dist name stays a claim.
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    pth_only = _make_dist_info(site_dir, "foo-dist", "1.0")
+    _write_record(
+        pth_only,
+        "../../bin/foo-tool,,",
+        "_editable_impl_foo_dist.pth,,",
+        "foo_dist-1.0.dist-info/METADATA,,",
+        "foo_dist-1.0.dist-info/RECORD,,",
+    )
+    pth_and_module = _make_dist_info(site_dir, "bar-dist", "1.0")
+    _write_record(pth_and_module, "_bar_dist.pth,,", "_bar_dist.py,,")
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site_dir),),
+    )
+
+    analysis = installed_packages_analysis(Database())
+
+    names = {p.distribution_name: p.top_level_names for p in analysis.packages}
+    assert names == {"foo-dist": ("foo_dist",), "bar-dist": ("_bar_dist", "bar_dist")}
+
+
+def test_unreadable_record_keeps_dist_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A field over the csv module's size limit stops the reader with an error.
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    dist_info = _make_dist_info(site_dir, "foo-dist", "1.0")
+    _write_record(dist_info, "single.py,,", "x" * 200_000 + ",,")
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site_dir),),
+    )
+
+    analysis = installed_packages_analysis(Database())
+
+    assert analysis.packages[0].top_level_names == ("foo_dist",)
+
+
+def test_top_level_txt_still_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    dist_info = _make_dist_info(site_dir, "foo-dist", "1.0", top_level="foo")
+    _write_record(dist_info, "foo/__init__.py,,", "other.py,,")
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site_dir),),
+    )
+
+    analysis = installed_packages_analysis(Database())
+
+    assert analysis.packages[0].top_level_names == ("foo",)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_record_edit_matches_a_fresh_read(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    dist_info = _make_dist_info(site_dir, "foo-dist", "1.0")
+    _write_record(dist_info, "single.py,,")
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site_dir),),
+    )
+
+    incremental = Database(mode=mode)
+    assert installed_packages_analysis(incremental).packages[0].top_level_names == ("single",)
+
+    _write_record(dist_info, "other/__init__.py,,")
+    warm = installed_packages_analysis(incremental)
+
+    assert warm.packages[0].top_level_names == ("other",)
+    assert warm == installed_packages_analysis(Database(mode=mode))
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_import_of_record_only_dist_is_installed(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The import names differ from the dist name, so only the RECORD can tie
+    # them to the distribution.
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    dist_info = _make_dist_info(site_dir, "acme-toolkit", "2.0")
+    _write_record(
+        dist_info,
+        "acme/__init__.py,,",
+        "acme_cli.py,,",
+        "acme_toolkit-2.0.dist-info/RECORD,,",
+    )
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site_dir),),
+    )
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "app.py"
+    consumer.write_text("import acme.sub\nfrom acme_cli import main\n", encoding="utf-8")
+
+    db = Database(mode=mode)
+
+    for import_name in ("acme", "acme.sub", "acme_cli"):
+        resolution = resolve_import_name(db, import_name)
+        assert (resolution.origin, resolution.distribution_name) == ("installed", "acme-toolkit")
+
+    resolved = integrations.module_analysis(db, root, consumer).resolved_imports
+    assert [
+        (ref.module, ref.resolution, ref.distribution_name, ref.distribution_version)
+        for ref in resolved
+    ] == [
+        ("acme.sub", "installed", "acme-toolkit", "2.0"),
+        ("acme_cli", "installed", "acme-toolkit", "2.0"),
+    ]
 
 
 # ---------------------------------------------------------------------------
