@@ -5,6 +5,7 @@ import hashlib
 import json
 import sys
 import threading
+import traceback
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -21,6 +22,7 @@ from pyinc.integrations import (
 
 from ._document import InvalidParams, convert_payload_positions, negotiate_position_encoding
 from ._jsonrpc import (
+    BodyParseError,
     InvalidRequest,
     ParseError,
     read_message,
@@ -108,6 +110,102 @@ _JSONRPC_PARSE_ERROR = -32700
 _JSONRPC_INVALID_REQUEST = -32600
 _JSONRPC_METHOD_NOT_FOUND = -32601
 _JSONRPC_INVALID_PARAMS = -32602
+_JSONRPC_INTERNAL_ERROR = -32603
+
+# Methods whose params are void. JSON-RPC 2.0 allows only an object or an
+# array as params, but a method that reads nothing loses nothing by taking
+# null as absent.
+_VOID_PARAMS_METHODS = frozenset({"shutdown", "exit"})
+
+# Methods whose params must carry a TextDocumentIdentifier, and those that
+# must also carry a Position. These shapes are checked before a handler
+# runs, so a malformed message gets Invalid params, and a KeyError or
+# TypeError raised inside a handler is reported as the bug it is.
+_TEXT_DOCUMENT_METHODS = frozenset(
+    {
+        "textDocument/didOpen",
+        "textDocument/didChange",
+        "textDocument/didSave",
+        "textDocument/didClose",
+        "textDocument/documentSymbol",
+        "textDocument/hover",
+        "textDocument/completion",
+        "textDocument/definition",
+        "textDocument/declaration",
+        "textDocument/typeDefinition",
+        "textDocument/references",
+        "textDocument/documentHighlight",
+        "textDocument/linkedEditingRange",
+        "textDocument/prepareRename",
+        "textDocument/rename",
+        "textDocument/codeAction",
+        "textDocument/signatureHelp",
+        "textDocument/foldingRange",
+        "textDocument/selectionRange",
+        "textDocument/documentLink",
+        "textDocument/codeLens",
+        "textDocument/prepareCallHierarchy",
+        "textDocument/prepareTypeHierarchy",
+        "textDocument/inlayHint",
+        "textDocument/semanticTokens/full",
+        "textDocument/semanticTokens/range",
+        "textDocument/diagnostic",
+    }
+)
+_POSITION_METHODS = frozenset(
+    {
+        "textDocument/hover",
+        "textDocument/completion",
+        "textDocument/definition",
+        "textDocument/declaration",
+        "textDocument/typeDefinition",
+        "textDocument/references",
+        "textDocument/documentHighlight",
+        "textDocument/linkedEditingRange",
+        "textDocument/prepareRename",
+        "textDocument/rename",
+        "textDocument/signatureHelp",
+        "textDocument/prepareCallHierarchy",
+        "textDocument/prepareTypeHierarchy",
+    }
+)
+
+
+def _is_position(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and type(value.get("line")) is int
+        and type(value.get("character")) is int
+    )
+
+
+def _validate_params(method: str, params: Any) -> None:
+    """Raise InvalidParams when ``params`` lacks a field ``method`` reads."""
+
+    if not isinstance(params, dict):
+        return
+    if method in _TEXT_DOCUMENT_METHODS:
+        document = params.get("textDocument")
+        if not isinstance(document, dict) or not isinstance(document.get("uri"), str):
+            raise InvalidParams("textDocument.uri must be a string")
+        if method == "textDocument/didOpen" and not isinstance(document.get("text"), str):
+            raise InvalidParams("textDocument.text must be a string")
+    if method in _POSITION_METHODS and not _is_position(params.get("position")):
+        raise InvalidParams("position must have integer line and character")
+    if method == "textDocument/selectionRange":
+        positions = params.get("positions") or []
+        if not isinstance(positions, list) or not all(_is_position(item) for item in positions):
+            raise InvalidParams("positions must be a list of positions")
+
+
+def _log_handler_error(method: str, kind: str) -> None:
+    """Print the exception being handled, with its traceback, to stderr."""
+
+    print(
+        f"pyinc-tools lsp: {method} {kind} raised:\n{traceback.format_exc()}",
+        end="",
+        file=sys.stderr,
+    )
 
 
 def _package_version() -> str:
@@ -154,7 +252,7 @@ def _range_to_lsp(source_range: SourceRange) -> dict[str, dict[str, int]]:
 def _uri_to_path(uri: str) -> str:
     parsed = urlparse(uri)
     if parsed.scheme != "file":
-        raise ValueError(f"Unsupported URI scheme: {parsed.scheme!r}")
+        raise InvalidParams(f"Unsupported URI scheme: {parsed.scheme!r}")
     return str(Path(url2pathname(parsed.path)).resolve(strict=False))
 
 
@@ -429,9 +527,15 @@ class LanguageServer:
             while True:
                 try:
                     message = self._read_message()
-                except ParseError:
+                except BodyParseError:
+                    # The frame was read whole, so the next one can still be
+                    # found and the loop keeps serving.
                     self._send_error(None, _JSONRPC_PARSE_ERROR, "Parse error")
-                    return 0
+                    continue
+                except ParseError:
+                    # Broken headers leave no way to find the next frame.
+                    self._send_error(None, _JSONRPC_PARSE_ERROR, "Parse error")
+                    return 1
                 except InvalidRequest:
                     self._send_error(None, _JSONRPC_INVALID_REQUEST, "Invalid Request")
                     continue
@@ -443,6 +547,12 @@ class LanguageServer:
             self._teardown_session()
 
     def _handle_message(self, message: dict[str, Any]) -> bool:
+        if (
+            message.get("params", {}) is None
+            and isinstance(message.get("method"), str)
+            and message["method"] in _VOID_PARAMS_METHODS
+        ):
+            message = {key: value for key, value in message.items() if key != "params"}
         try:
             validate_request(message)
         except InvalidRequest:
@@ -468,36 +578,41 @@ class LanguageServer:
                 self._send_error(request_id, _LSP_REQUEST_FAILED, str(exc))
             except _MethodNotFound:
                 self._send_error(request_id, _JSONRPC_METHOD_NOT_FOUND, "Method not found")
-            except (InvalidParams, KeyError, TypeError, ValueError) as exc:
+            except InvalidParams as exc:
+                # Raised by the params checks, by the conversion of the client's
+                # positions, and where _uri_to_path, _require_safe_path or
+                # _initialize refuse a URI, path or root the client named.
                 self._send_error(
                     request_id,
                     _JSONRPC_INVALID_PARAMS,
                     f"Invalid params: {exc}",
                 )
-            except Exception:  # pragma: no cover - defensive JSON-RPC boundary
-                self._send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "error": {"code": -32603, "message": "Internal error"},
-                    }
-                )
+            except Exception:
+                # Anything else is a fault in the server, most often a bug.
+                # The traceback goes to stderr, which clients keep as the
+                # server's log.
+                _log_handler_error(method, "request")
+                self._send_error(request_id, _JSONRPC_INTERNAL_ERROR, "Internal error")
             else:
-                self._send({"jsonrpc": "2.0", "id": request_id, "result": result})
+                try:
+                    self._send({"jsonrpc": "2.0", "id": request_id, "result": result})
+                except (TypeError, ValueError):
+                    # The result does not serialize to JSON. Nothing has been
+                    # written yet, so the request still gets a reply.
+                    _log_handler_error(method, "request")
+                    self._send_error(request_id, _JSONRPC_INTERNAL_ERROR, "Internal error")
             return True
 
         try:
+            _validate_params(method, params)
             return self._handle_notification(method, params)
-        except (InvalidParams, KeyError, TypeError, ValueError):
+        except InvalidParams:
             return True
-        except Exception as exc:
+        except Exception:
             # Notifications have no response to carry an error. So a failed
-            # handler (e.g. an OSError from a mirror write) is logged and the
-            # loop keeps serving, like the request branch's catch-all.
-            print(
-                f"pyinc-tools lsp: {method} notification raised: {type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
+            # handler (e.g. an OSError from a mirror write) is logged with its
+            # traceback and the loop keeps serving, like the request branch.
+            _log_handler_error(method, "notification")
             return True
 
     def _handle_request(self, method: str, params: Any) -> Any:
@@ -510,6 +625,7 @@ class LanguageServer:
             raise _InvalidLifecycleRequest("Request received after shutdown")
         if not isinstance(params, dict):
             raise InvalidParams("LSP params must be an object")
+        _validate_params(method, params)
         if method == "initialize":
             return self._dispatch_request(method, params)
         uri = self._default_uri(params)
@@ -521,13 +637,18 @@ class LanguageServer:
             uri=uri,
         )
         result = self._dispatch_request(method, converted_params)
-        return convert_payload_positions(
-            result,
-            encoding=self._position_encoding,
-            to_client=True,
-            source_for_uri=self._source_for_uri,
-            uri=uri,
-        )
+        try:
+            return convert_payload_positions(
+                result,
+                encoding=self._position_encoding,
+                to_client=True,
+                source_for_uri=self._source_for_uri,
+                uri=uri,
+            )
+        except InvalidParams as exc:
+            # The result holds a position its document does not have. The
+            # client sent nothing wrong, so this is reported as a server fault.
+            raise RuntimeError(f"{method} result has a bad position: {exc}") from exc
 
     def _dispatch_request(self, method: str, params: Any) -> Any:
         if method == "initialize":
@@ -795,7 +916,12 @@ class LanguageServer:
             else ()
         )
         try:
-            session = WorkspaceSession(root, exclude_globs=exclude_globs)
+            try:
+                session = WorkspaceSession(root, exclude_globs=exclude_globs)
+            except ValueError as exc:
+                # The session refuses a root that is not a directory, or that
+                # holds a file it cannot mirror.
+                raise InvalidParams(str(exc)) from exc
             with self._publish_lock, self._write_lock:
                 self._session = session
                 self._published_paths.clear()
@@ -1684,7 +1810,10 @@ class LanguageServer:
         path = _uri_to_path(uri)
         root = Path(self._require_session().root).resolve(strict=False)
         resolved = Path(path).resolve(strict=False)
-        resolved.relative_to(root)  # raises ValueError if path escapes workspace
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise InvalidParams(str(exc)) from exc
         return str(resolved)
 
     def _require_session(self) -> WorkspaceSession:

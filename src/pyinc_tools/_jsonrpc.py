@@ -8,16 +8,38 @@ class ParseError(ValueError):
     """A framed message failed to decode as JSON."""
 
 
+class BodyParseError(ParseError):
+    """A whole frame was read, but its body could not be taken.
+
+    The stream is left at the start of the next frame, so a server can reply
+    with a parse error and keep reading. A plain ParseError means the headers
+    are broken and the next frame cannot be found.
+    """
+
+
 class InvalidRequest(ValueError):
     """A decoded JSON value is an invalid JSON-RPC request object."""
 
 
 _MAX_HEADER_BYTES = 64 * 1024
 _MAX_CONTENT_LENGTH = 16 * 1024 * 1024
+# A longer Content-Length is read as a broken header. A body over the size
+# limit but within this many digits is read and dropped instead.
+_MAX_CONTENT_LENGTH_DIGITS = 10
+_DISCARD_CHUNK_BYTES = 64 * 1024
 
 
 def _reject_json_constant(value: str) -> object:
     raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _discard_body(stream: BinaryIO, length: int) -> None:
+    remaining = length
+    while remaining:
+        chunk = stream.read(min(remaining, _DISCARD_CHUNK_BYTES))
+        if not chunk:
+            raise ParseError("truncated JSON-RPC body")
+        remaining -= len(chunk)
 
 
 def read_message(stream: BinaryIO) -> dict[str, Any] | None:
@@ -56,14 +78,21 @@ def read_message(stream: BinaryIO) -> dict[str, Any] | None:
     if not content_length.isdigit():
         raise ParseError("Content-Length must be a non-negative integer")
     significant_length = content_length.lstrip("0") or "0"
-    if len(significant_length) > len(str(_MAX_CONTENT_LENGTH)):
-        raise ParseError(f"Content-Length exceeds the {_MAX_CONTENT_LENGTH}-byte JSON-RPC limit")
+    if len(significant_length) > _MAX_CONTENT_LENGTH_DIGITS:
+        raise ParseError(
+            f"Content-Length exceeds the {_MAX_CONTENT_LENGTH_DIGITS}-digit JSON-RPC limit"
+        )
     try:
         length = int(content_length)
     except (ValueError, OverflowError) as exc:
         raise ParseError("Content-Length must be a non-negative integer") from exc
     if length > _MAX_CONTENT_LENGTH:
-        raise ParseError(f"Content-Length exceeds the {_MAX_CONTENT_LENGTH}-byte JSON-RPC limit")
+        # The body is read and dropped, so the stream stays on a frame
+        # boundary and the next message can still be read.
+        _discard_body(stream, length)
+        raise BodyParseError(
+            f"Content-Length exceeds the {_MAX_CONTENT_LENGTH}-byte JSON-RPC limit"
+        )
     body = stream.read(length)
     if len(body) != length:
         raise ParseError("truncated JSON-RPC body")
@@ -77,7 +106,7 @@ def read_message(stream: BinaryIO) -> dict[str, Any] | None:
         RecursionError,
         OverflowError,
     ) as exc:
-        raise ParseError("invalid UTF-8 JSON-RPC body") from exc
+        raise BodyParseError("invalid UTF-8 JSON-RPC body") from exc
     if not isinstance(payload, dict):
         raise InvalidRequest("JSON-RPC request must be an object")
     return cast(dict[str, Any], payload)
@@ -110,6 +139,7 @@ def write_message(stream: BinaryIO, payload: dict[str, Any]) -> None:
 
 
 __all__ = [
+    "BodyParseError",
     "InvalidRequest",
     "ParseError",
     "read_message",

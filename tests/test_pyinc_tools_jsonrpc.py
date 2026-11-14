@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,13 @@ import pytest
 
 import pyinc_tools._jsonrpc as jsonrpc_module
 from pyinc_tools._document import InvalidParams, convert_payload_positions
-from pyinc_tools._jsonrpc import InvalidRequest, ParseError, read_message, write_message
+from pyinc_tools._jsonrpc import (
+    BodyParseError,
+    InvalidRequest,
+    ParseError,
+    read_message,
+    write_message,
+)
 from pyinc_tools.lsp import LanguageServer
 from pyinc_tools.session import WorkspaceSession
 
@@ -68,10 +75,26 @@ def test_read_message_rejects_integer_conversion_bomb_as_parse_error() -> None:
         read_message(io.BytesIO(b"Content-Length: " + value + b"\r\n\r\n"))
 
 
-def test_read_message_rejects_oversized_body_before_reading_it() -> None:
+def test_read_message_discards_oversized_body_and_reads_next_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jsonrpc_module, "_MAX_CONTENT_LENGTH", 16)
+    # Larger than one discard chunk, so the body is dropped over several reads.
+    body = b"x" * (3 * 64 * 1024 + 1)
+    stream = io.BytesIO(
+        f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body + _frame({"id": 1})
+    )
+
+    with pytest.raises(BodyParseError, match="exceeds"):
+        read_message(stream)
+    assert read_message(stream) == {"id": 1}
+
+
+def test_read_message_reports_truncated_oversized_body_as_broken_framing() -> None:
     length = jsonrpc_module._MAX_CONTENT_LENGTH + 1
-    with pytest.raises(ParseError, match="exceeds"):
+    with pytest.raises(ParseError, match="truncated JSON-RPC body") as raised:
         read_message(io.BytesIO(f"Content-Length: {length}\r\n\r\n".encode("ascii")))
+    assert type(raised.value) is ParseError
 
 
 @pytest.mark.parametrize(
@@ -94,7 +117,7 @@ def test_read_message_rejects_malformed_or_truncated_frames(payload: bytes, mess
 @pytest.mark.parametrize("body", [b"\xff", b"{", b'{"value":NaN}'])
 def test_read_message_rejects_invalid_json(body: bytes) -> None:
     stream = io.BytesIO(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
-    with pytest.raises(ParseError, match="invalid UTF-8 JSON-RPC body"):
+    with pytest.raises(BodyParseError, match="invalid UTF-8 JSON-RPC body"):
         read_message(stream)
 
 
@@ -102,7 +125,7 @@ def test_read_message_rejects_deep_json_as_parse_error() -> None:
     body = b'{"jsonrpc":"2.0","method":"x","params":' + b"[" * 200_000
     body += b"0" + b"]" * 200_000 + b"}"
     stream = io.BytesIO(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
-    with pytest.raises(ParseError, match="invalid UTF-8 JSON-RPC body"):
+    with pytest.raises(BodyParseError, match="invalid UTF-8 JSON-RPC body"):
         read_message(stream)
 
 
@@ -232,6 +255,7 @@ def test_language_server_preserves_valid_request_ids(
         {"jsonrpc": "2.0", "id": [], "method": "unknown/method"},
         {"jsonrpc": "2.0", "id": {}, "method": "unknown/method"},
         {"jsonrpc": "2.0", "id": 1, "method": "unknown/method", "params": 1},
+        {"jsonrpc": "2.0", "id": 1, "method": "workspace/symbol", "params": None},
     ],
 )
 def test_language_server_rejects_invalid_request_envelopes(
@@ -482,3 +506,376 @@ def test_language_server_rejects_split_surrogate_position(tmp_path: Path) -> Non
         assert response["error"]["code"] == -32602
     finally:
         server._teardown_session()
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        b"Content-Type: application/json\r\n\r\n{}",
+        b"Content-Length: nope\r\n\r\n{}",
+        b"Content-Length: 10000000000\r\n\r\n",
+        b"Not-A-Header\r\n\r\n",
+        b"Content-Length: 4\r\n\r\n{}",
+    ],
+)
+def test_read_message_reports_broken_framing_as_plain_parse_error(frame: bytes) -> None:
+    with pytest.raises(ParseError) as raised:
+        read_message(io.BytesIO(frame))
+    assert type(raised.value) is ParseError
+
+
+_PARSE_ERROR_REPLY = {
+    "jsonrpc": "2.0",
+    "id": None,
+    "error": {"code": -32700, "message": "Parse error"},
+}
+_SHUTDOWN = {"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": {}}
+_EXIT = {"jsonrpc": "2.0", "method": "exit", "params": {}}
+_WORKSPACE_SYMBOL = {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "method": "workspace/symbol",
+    "params": {"query": ""},
+}
+_INTERNAL_ERROR_REPLY = {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "error": {"code": -32603, "message": "Internal error"},
+}
+
+
+def _initialize_request(root: Path) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "rootUri": root.as_uri(),
+            "initializationOptions": {"pyinc.watcher.enabled": False},
+        },
+    }
+
+
+def _read_messages(output: io.BytesIO) -> list[dict[str, Any]]:
+    output.seek(0)
+    messages: list[dict[str, Any]] = []
+    while (message := read_message(output)) is not None:
+        messages.append(message)
+    return messages
+
+
+def _serve(frames: bytes) -> tuple[int, list[dict[str, Any]]]:
+    output = io.BytesIO()
+    status = LanguageServer(in_stream=io.BytesIO(frames), out_stream=output).serve()
+    return status, _read_messages(output)
+
+
+def _assert_served_lifecycle(messages: list[dict[str, Any]]) -> None:
+    assert messages[0]["id"] == 1
+    assert "result" in messages[0]
+    assert messages[-1] == {"jsonrpc": "2.0", "id": 2, "result": None}
+
+
+@pytest.mark.parametrize("body", [b"{", b"\xff", b'{"value":NaN}'])
+def test_invalid_json_body_then_request_is_answered(body: bytes, tmp_path: Path) -> None:
+    bad_frame = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+
+    status, messages = _serve(
+        bad_frame + _frame(_initialize_request(tmp_path)) + _frame(_SHUTDOWN) + _frame(_EXIT)
+    )
+
+    assert status == 0
+    assert messages[0] == _PARSE_ERROR_REPLY
+    _assert_served_lifecycle(messages[1:])
+    assert len(messages) == 3
+
+
+def test_oversize_body_is_discarded_then_request_is_answered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    limit = 1024
+    initialize = _initialize_request(tmp_path)
+    assert len(_frame(initialize)) < limit
+    # A well-formed request padded past the limit. It is dropped unanswered.
+    oversize = {
+        "jsonrpc": "2.0",
+        "id": 99,
+        "method": "workspace/symbol",
+        "params": {"query": "x" * (3 * 64 * 1024)},
+    }
+
+    frames = _frame(oversize) + _frame(initialize) + _frame(_SHUTDOWN) + _frame(_EXIT)
+    output = io.BytesIO()
+    # The limit applies to the server's reads only. The initialize reply is
+    # larger than it.
+    with monkeypatch.context() as patch:
+        patch.setattr(jsonrpc_module, "_MAX_CONTENT_LENGTH", limit)
+        status = LanguageServer(in_stream=io.BytesIO(frames), out_stream=output).serve()
+    messages = _read_messages(output)
+
+    assert status == 0
+    assert messages[0] == _PARSE_ERROR_REPLY
+    _assert_served_lifecycle(messages[1:])
+    assert len(messages) == 3
+
+
+def test_broken_header_ends_the_server_with_status_1() -> None:
+    status, messages = _serve(b"Not-A-Header\r\n\r\n" + _frame(_SHUTDOWN))
+
+    assert status == 1
+    assert messages == [_PARSE_ERROR_REPLY]
+
+
+def test_shutdown_and_exit_with_null_params_stop_the_server(tmp_path: Path) -> None:
+    shutdown = {"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": None}
+    exit_notification = {"jsonrpc": "2.0", "method": "exit", "params": None}
+
+    status, messages = _serve(
+        _frame(_initialize_request(tmp_path))
+        + _frame(shutdown)
+        + _frame(exit_notification)
+        + _frame(_WORKSPACE_SYMBOL)
+    )
+
+    assert status == 0
+    _assert_served_lifecycle(messages)
+    assert len(messages) == 2
+
+
+def test_exit_with_null_params_without_shutdown_returns_1() -> None:
+    exit_notification = {"jsonrpc": "2.0", "method": "exit", "params": None}
+
+    status, messages = _serve(_frame(exit_notification) + _frame(_SHUTDOWN))
+
+    assert status == 1
+    assert messages == []
+
+
+def _patch_workspace_symbol(monkeypatch: pytest.MonkeyPatch, handler: Callable[[], Any]) -> None:
+    original = LanguageServer._dispatch_request
+
+    def dispatch(self: LanguageServer, method: str, params: Any) -> Any:
+        if method == "workspace/symbol":
+            return handler()
+        return original(self, method, params)
+
+    monkeypatch.setattr(LanguageServer, "_dispatch_request", dispatch)
+
+
+def test_unserializable_result_gives_internal_error_and_keeps_serving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_workspace_symbol(monkeypatch, lambda: {"a set", "is not JSON"})
+
+    status, messages = _serve(
+        _frame(_initialize_request(tmp_path))
+        + _frame(_WORKSPACE_SYMBOL)
+        + _frame(_SHUTDOWN)
+        + _frame(_EXIT)
+    )
+
+    assert status == 0
+    assert messages[1] == _INTERNAL_ERROR_REPLY
+    _assert_served_lifecycle(messages)
+    error_output = capsys.readouterr().err
+    assert "Traceback" in error_output
+    assert "TypeError" in error_output
+
+
+@pytest.mark.parametrize("error_type", [KeyError, TypeError, ValueError, RuntimeError])
+def test_handler_bug_logs_traceback_and_gives_internal_error(
+    error_type: type[Exception],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def broken_handler() -> Any:
+        raise error_type("handler bug")
+
+    _patch_workspace_symbol(monkeypatch, broken_handler)
+
+    status, messages = _serve(
+        _frame(_initialize_request(tmp_path))
+        + _frame(_WORKSPACE_SYMBOL)
+        + _frame(_SHUTDOWN)
+        + _frame(_EXIT)
+    )
+
+    assert status == 0
+    assert messages[1] == _INTERNAL_ERROR_REPLY
+    _assert_served_lifecycle(messages)
+    error_output = capsys.readouterr().err
+    assert "workspace/symbol" in error_output
+    assert "Traceback" in error_output
+    assert f"{error_type.__name__}: " in error_output
+
+
+def test_result_position_outside_its_document_gives_internal_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = tmp_path / "mod.py"
+    module.write_text("x = 1\n", encoding="utf-8")
+    uri = module.as_uri()
+    original = LanguageServer._dispatch_request
+
+    def dispatch(self: LanguageServer, method: str, params: Any) -> Any:
+        if method == "textDocument/definition":
+            line_40 = {"line": 40, "character": 0}
+            return {"uri": uri, "range": {"start": line_40, "end": line_40}}
+        return original(self, method, params)
+
+    monkeypatch.setattr(LanguageServer, "_dispatch_request", dispatch)
+    definition = {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "textDocument/definition",
+        "params": {"textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}},
+    }
+
+    status, messages = _serve(
+        _frame(_initialize_request(tmp_path))
+        + _frame(definition)
+        + _frame(_SHUTDOWN)
+        + _frame(_EXIT)
+    )
+
+    assert status == 0
+    assert messages[1] == _INTERNAL_ERROR_REPLY
+    _assert_served_lifecycle(messages)
+    error_output = capsys.readouterr().err
+    assert "textDocument/definition" in error_output
+    assert "Traceback" in error_output
+
+
+_URI = "file:///workspace/mod.py"
+
+
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("textDocument/hover", {}),
+        ("textDocument/hover", {"textDocument": _URI, "position": {"line": 0, "character": 0}}),
+        ("textDocument/definition", {"textDocument": {"uri": _URI}}),
+        ("textDocument/references", {"textDocument": {"uri": _URI}, "position": [0, 0]}),
+        ("textDocument/selectionRange", {"textDocument": {"uri": _URI}, "positions": ["0:0"]}),
+        ("textDocument/documentSymbol", {"textDocument": {"uri": 7}}),
+    ],
+)
+def test_malformed_request_params_get_invalid_params_without_traceback(
+    method: str,
+    params: dict[str, Any],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request = {"jsonrpc": "2.0", "id": 5, "method": method, "params": params}
+
+    status, messages = _serve(
+        _frame(_initialize_request(tmp_path)) + _frame(request) + _frame(_SHUTDOWN) + _frame(_EXIT)
+    )
+
+    assert status == 0
+    assert messages[1]["id"] == 5
+    assert messages[1]["error"]["code"] == -32602
+    _assert_served_lifecycle(messages)
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("uri", ["untitled:Untitled-1", "outside"])
+def test_refused_document_uri_gets_invalid_params_without_traceback(
+    uri: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    if uri == "outside":
+        outside = tmp_path / "outside.py"
+        outside.write_text("x = 1\n", encoding="utf-8")
+        uri = outside.as_uri()
+    hover = {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "textDocument/hover",
+        "params": {"textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}},
+    }
+
+    status, messages = _serve(
+        _frame(_initialize_request(root)) + _frame(hover) + _frame(_SHUTDOWN) + _frame(_EXIT)
+    )
+
+    assert status == 0
+    assert messages[1]["id"] == 5
+    assert messages[1]["error"]["code"] == -32602
+    _assert_served_lifecycle(messages)
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("root_uri", ["http://example.invalid/root", "missing"])
+def test_refused_root_gets_invalid_params_without_traceback(
+    root_uri: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    if root_uri == "missing":
+        root_uri = (tmp_path / "missing").as_uri()
+    initialize = _initialize_request(tmp_path)
+    initialize["params"]["rootUri"] = root_uri
+
+    status, messages = _serve(_frame(initialize) + _frame(_EXIT))
+
+    assert status == 1
+    assert len(messages) == 1
+    assert messages[0]["id"] == 1
+    assert messages[0]["error"]["code"] == -32602
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("error_type", [KeyError, ValueError])
+def test_notification_handler_bug_logs_traceback_and_keeps_serving(
+    error_type: type[Exception],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    original = LanguageServer._handle_notification
+
+    def handle(self: LanguageServer, method: str, params: Any) -> bool:
+        if method == "initialized":
+            raise error_type("handler bug")
+        return original(self, method, params)
+
+    monkeypatch.setattr(LanguageServer, "_handle_notification", handle)
+    initialized = {"jsonrpc": "2.0", "method": "initialized", "params": {}}
+
+    status, messages = _serve(
+        _frame(_initialize_request(tmp_path))
+        + _frame(initialized)
+        + _frame(_SHUTDOWN)
+        + _frame(_EXIT)
+    )
+
+    assert status == 0
+    _assert_served_lifecycle(messages)
+    error_output = capsys.readouterr().err
+    assert "initialized" in error_output
+    assert "Traceback" in error_output
+    assert f"{error_type.__name__}: " in error_output
+
+
+def test_malformed_notification_params_are_dropped_without_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    did_open = {
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {"textDocument": {"uri": (tmp_path / "mod.py").as_uri()}},
+    }
+
+    status, messages = _serve(
+        _frame(_initialize_request(tmp_path)) + _frame(did_open) + _frame(_SHUTDOWN) + _frame(_EXIT)
+    )
+
+    assert status == 0
+    _assert_served_lifecycle(messages)
+    assert len(messages) == 2
+    assert capsys.readouterr().err == ""
