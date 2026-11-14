@@ -85,26 +85,46 @@ execution is recorded.
 
 ## What is the overhead?
 
-No per-query overhead figure is published, and this page will not invent one.
+`python -m bench.overhead`, run from the repository root, prints five cost
+ratios. Both sides of a ratio run in one process, one after the other. One run
+of 6.0.0 on CPython 3.14.7 and Linux, on an idle Intel Core 7 240H, printed:
 
-What is published:
+| Comparison | Ratio | Timings |
+|---|---|---|
+| A warm `db.get` of a trivial query against a `functools.lru_cache` hit | 3,957x | 64.94 us against 16.41 ns |
+| A warm get of a query that reads a 4 KiB file through `FileResource` against `open().read()` of that file | 424x | 1.57 ms against 3.71 us |
+| The trivial query annotated `db: Database` in a module without `from __future__ import annotations` against the same query in a module with the import | 6.3x | 399.31 us against 63.83 us |
+| A cold `analyze_workspace` of `src/pyinc_tools` against a second analysis with nothing changed | 9.6x | 11.21 s against 1.16 s |
+| The file read with the resource identity memo off against the read with it on | 25x | 40.02 ms against 1.59 ms |
 
-- The [benchmark and correctness harness](../bench/README.md), which runs a
-  fixed 67-row matrix comparing pyinc against fresh recomputation, an
-  intentionally incomplete naive cache, and `joblib.Memory`.
+`--root PATH` points the fourth line at another workspace. On pyinc's own `src`
+directory the same build printed 5.4x, 23.38 s against 4.35 s, and the second
+analysis executed no query.
 
-No wall-clock table is published. Correctness and deterministic work counts
-are release gates. Timings are environment-specific diagnostics and never
-thresholds, so a figure measured on one CI runner would tell you little about
-your machine. Measure on your own hardware:
+Each top-level `db.get` observes every definition the query captures again
+before it reuses a stored result, and probes each resource the result read.
+The first two rows measure that check. It is the least a warm get costs, so a
+query body must cost more than the check before pyinc saves any time. An
+evaluated `db: Database` annotation makes the query capture the class, and
+each warm get then checks `pyinc/runtime.py` as well, which is the third row.
+The examples in these docs start with `from __future__ import annotations` for
+that reason.
+
+Loading a checkpoint whose inputs are unchanged runs no query body and loads
+no resource. It still derives every identity and probes every resource again,
+so a restore saves time only when the bodies cost more than that verification.
+
+The ratios are machine-specific, and the timings are diagnostics. Correctness
+and deterministic work counts are the release gates. The
+[benchmark and correctness harness](../bench/README.md) runs a fixed 67-row
+matrix that compares pyinc against fresh recomputation, an intentionally
+incomplete naive cache, and `joblib.Memory`. Run both on your own hardware:
 
 ```console
 python -m pip install -e '.[bench]' -c constraints.txt
+python -m bench.overhead
 python -m bench.run --output bench/results --repetitions 5
 ```
-
-The demo shows the shape of the trade on any machine. The first pass pays to
-record the graph, and each later request is charged for what changed.
 
 ## What about the GIL, free-threaded builds, and multiprocessing?
 

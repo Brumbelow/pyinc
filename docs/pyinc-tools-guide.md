@@ -145,6 +145,14 @@ diagnostic unless an optional dependency group names it. Dependencies listed
 only under `[dependency-groups]` are not read, so an import they cover gets
 the diagnostic too.
 
+`unresolved-symbol` is reported only when the module shows no sign of binding
+the name. A name the module binds at module scope under `if`, `try`, `with` or
+a loop gets no diagnostic, and neither does any name from a module that
+star-imports from outside the workspace or defines a module-level
+`__getattr__`. A name that reaches the module only through a star import of
+another workspace module is still reported when that module binds it
+conditionally.
+
 `unused-import` checks only `from` imports of workspace modules, and never in
 an `__init__.py` file. It skips a file that does not parse, a star import, a
 `from m import x as x` re-export, a name in the module's `__all__`, and a name
@@ -201,6 +209,15 @@ two paths at a time for a given watcher.
 different threads. Each waits for the others, so a stop or a close that lands
 while the watcher starts stops the thread it starts. `poll()` refuses while
 the watcher is running.
+
+A repeated analysis reuses every stored result whose inputs are unchanged.
+With nothing changed, it runs only the queries that read `sys.path` and `.pth`
+files, and its time goes to verifying the stored results.
+`python -m bench.overhead --root PATH`, run from a checkout of the repository,
+prints the ratio of a cold analysis to such a second one. One run of 6.0.0 on
+CPython 3.14.7, on an idle Intel Core 7 240H, printed 9.6x for
+`src/pyinc_tools` (11.21 s against 1.16 s) and 5.4x for pyinc's whole `src`
+directory (23.38 s against 4.35 s).
 
 ## Start the LSP server
 
@@ -304,7 +321,9 @@ out of the source tree.
    includes with `-r` or `-c`, and nothing else. It raises `ValueError` when
    the workspace holds more than `max_files` of them, 1,000 by default.
 2. `set_overlay(path, text)` replaces the mirror copy only. LSP open and change
-   notifications use it.
+   notifications use it. Text for a file the mirror does not copy, such as one
+   under a skipped or excluded directory, is not written, so that file stays
+   out of the analysis.
 3. `refresh_paths(paths)` syncs saved disk changes into files that have no
    active overlay. Polling and watched-file notifications use it.
 4. Results are mapped back to real workspace paths before they reach callers,
@@ -329,7 +348,11 @@ skipped wherever the walk meets one: a linked file, a linked directory, a
 Windows junction, a dangling link such as the lock file Emacs writes beside a
 modified buffer, and a linked requirements file. A link whose target lies
 outside the root refuses the workspace, and so does a file the process cannot
-read. Avoid renaming a workspace root while a session is synchronizing it.
+read. A file or directory that becomes a link inside the root while a session
+is open leaves the mirror at the next poll of the built-in watcher. With the
+watcher off, a `workspace/didChangeWatchedFiles` notification for that path
+refreshes the link's target and the old copy stays. Avoid renaming a workspace
+root while a session is synchronizing it.
 
 All public source ranges are zero-based and end-exclusive. Library positions
 count Unicode code points. The LSP boundary converts them to the encoding
@@ -427,7 +450,10 @@ import that uses it, even when the root holds no manifest. The
 `undeclared-import` diagnostic needs a manifest, as
 [Diagnostic codes](#diagnostic-codes) states. A requirements line that names
 no distribution, such as a bare path or URL, is not checked against the
-installed packages. Check that the selected root contains the expected
+installed packages. A failing requirement that only an included file lists is
+reported at the first line of the root `requirements.txt`. Environment markers
+are not evaluated, so a requirement whose marker excludes the running
+interpreter is still checked. Check that the selected root contains the expected
 `pyproject.toml` or `requirements.txt`, and that your source files sit outside
 the excluded paths.
 

@@ -19,6 +19,9 @@ configuration are in the [`pyinc-tools` guide](pyinc-tools-guide.md).
 - A request about a document outside the workspace root, or with a scheme
   other than `file`, gets null. `textDocument/diagnostic` gets an empty
   report instead. A notification about such a document is dropped.
+- A request about a document the mirror does not copy, such as a file under a
+  skipped or excluded directory, gets null or an empty result, and no
+  diagnostics are published for it.
 - Position conversion ends a line only at `\n`, `\r\n`, or `\r`, as LSP
   does. Completion, prepareRename, rename, semantic tokens, code lens, call
   and type hierarchy, the quick fix that retargets an import, and
@@ -58,7 +61,7 @@ configuration are in the [`pyinc-tools` guide](pyinc-tools-guide.md).
 | `textDocument/inlayHint` | Parameter-name hints for positional arguments. | Parameter-name hints only, with no variable or return-type hints. Keyword, spread, dynamically resolved, and non-workspace calls are omitted. |
 | `textDocument/semanticTokens/full`, `textDocument/semanticTokens/range` | Namespace, class, function, method, parameter, and variable tokens. A `from ... import ...` use is classified by the workspace declaration it resolves to. | Full responses only, with no deltas. Use-site classification covers lexical names and skips general attribute chains. Imports that resolve outside the workspace, or ambiguously, are left unclassified. |
 | `textDocument/diagnostic`, `workspace/diagnostic` | Pull diagnostics with stable unchanged/full reports. | Not advertised, because the server already pushes the same diagnostics. Answered for a client that sends them anyway. Diagnostics cover the shipped analyses only, with no general Python type checking or linting. |
-| `textDocument/publishDiagnostics` | Push diagnostics after `initialized`, open/change/save/close, and filesystem refreshes. Pushes reach the client in the order their analyses ran. The server pushes to every client, whatever pull support the client declares. | Identical payloads are deduplicated per document. A file whose diagnostics clear receives one empty publication. |
+| `textDocument/publishDiagnostics` | Push diagnostics after `initialized`, open/change/save/close, and filesystem refreshes. Pushes reach the client in the order their analyses ran. The server pushes to every client, whatever pull support the client declares. | Identical payloads are deduplicated per document. A file whose diagnostics clear receives one empty publication. A range that falls outside the document's current text is moved to the nearest position inside it before it is sent. |
 | `workspace/willRenameFiles` | Import edits for renamed Python module files. | Module files only. Package-directory renames, imports inside the renamed file, and attribute-use rewrites are out of scope. |
 | `workspace/willDeleteFiles` | Removes imports that refer to deleted Python module files. | Module files only. Package deletes and downstream attribute-use cleanup are out of scope. |
 
