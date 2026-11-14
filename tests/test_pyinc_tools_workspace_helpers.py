@@ -1596,3 +1596,121 @@ def test_session_refuses_a_link_out_of_the_root(
 
     with pytest.raises(ValueError, match="workspace symlink escapes the root"):
         WorkspaceSession(root)
+
+
+@pytest.mark.parametrize(
+    ("relative", "exclude_globs"),
+    [
+        ("venv/lib/req/__init__.py", ()),
+        ("tools/runner/lib/mod.py", ()),
+        ("build/gen.py", ("build",)),
+    ],
+)
+def test_an_overlay_under_a_directory_the_walk_skips_stays_out_of_the_analysis(
+    tmp_path: Path, relative: str, exclude_globs: tuple[str, ...]
+) -> None:
+    root = tmp_path / "root"
+    (root / "tools" / "runner").mkdir(parents=True)
+    (root / "tools" / "runner" / "pyvenv.cfg").write_text("home = /usr\n", encoding="utf-8")
+    (root / "app.py").write_text("x = 1\n", encoding="utf-8")
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("from . import sessions\n", encoding="utf-8")
+
+    with WorkspaceSession(root, exclude_globs=exclude_globs) as fresh:
+        expected = fresh.analyze_workspace()
+        expected_mirror = _mirrored_files(Path(fresh.mirror_root))
+
+    with WorkspaceSession(root, exclude_globs=exclude_globs) as session:
+        session.set_overlay(target, "import not_a_real_module_xyz\nfrom . import sessions\n")
+        opened = session.analyze_workspace()
+        opened_mirror = _mirrored_files(Path(session.mirror_root))
+        session.clear_overlay(target)
+        closed = session.analyze_workspace()
+        closed_mirror = _mirrored_files(Path(session.mirror_root))
+
+    real_target = str(target.resolve())
+    for result in (opened, closed):
+        assert real_target not in {module.path for module in result.python.modules}
+        assert real_target not in {diagnostic.path for diagnostic in result.diagnostics}
+        assert result == expected
+    assert opened_mirror == closed_mirror == expected_mirror
+
+
+def test_mirror_writes_an_overlay_only_for_a_file_it_copies(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    (root / "deps").mkdir(parents=True)
+    (root / "requirements.txt").write_text("-r deps/base.txt\n", encoding="utf-8")
+    (root / "deps" / "base.txt").write_text("demo==1\n", encoding="utf-8")
+    mirror_root = tmp_path / "mirror"
+    mirror = workspace.WorkspaceMirror(str(root), str(mirror_root), frozenset(), ())
+    mirror.copy_workspace()
+
+    for relative in (
+        "new.py",
+        "pyproject.toml",
+        "requirements.txt",
+        "deps/base.txt",
+        "deps/other.txt",
+        "notes.txt",
+        "pkg/pyproject.toml",
+    ):
+        mirror.write_overlay(mirror.normalize_real_path(root / relative), b"# edited\n")
+
+    assert _mirrored_files(mirror_root) == {
+        "new.py",
+        "pyproject.toml",
+        "requirements.txt",
+        "deps/base.txt",
+    }
+
+
+def test_language_server_publishes_nothing_for_a_file_opened_in_an_environment(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    package = root / "venv" / "lib" / "req"
+    package.mkdir(parents=True)
+    (root / "app.py").write_text("import not_a_real_module_xyz\n", encoding="utf-8")
+    target = package / "__init__.py"
+    text = "from . import sessions\nfrom .sessions import Session\n"
+    target.write_text(text, encoding="utf-8")
+    (package / "sessions.py").write_text("class Session:\n    pass\n", encoding="utf-8")
+    document = {"uri": target.as_uri(), "languageId": "python", "version": 1, "text": text}
+
+    server, reply = _initialize(root, {})
+    try:
+        assert "capabilities" in reply["result"]
+        for method, params in (
+            ("initialized", {}),
+            ("textDocument/didOpen", {"textDocument": document}),
+            ("textDocument/didClose", {"textDocument": {"uri": target.as_uri()}}),
+        ):
+            server._handle_message({"jsonrpc": "2.0", "method": method, "params": params})
+            assert server.wait_idle(120.0)
+        output = io.BytesIO(cast(io.BytesIO, server._output).getvalue())
+    finally:
+        server._teardown_session()
+
+    published: list[str] = []
+    while (message := read_message(output)) is not None:
+        if message.get("method") == "textDocument/publishDiagnostics":
+            published.append(message["params"]["uri"])
+    assert published == [(root / "app.py").as_uri()]
+
+
+def test_a_new_python_file_is_analyzed_from_its_overlay(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    target = root / "pkg" / "new.py"
+
+    with WorkspaceSession(root) as session:
+        session.set_overlay(target, "import not_a_real_module_xyz\n")
+        result = session.analyze_workspace()
+
+    assert not target.exists()
+    assert "pkg.new" in {module.module for module in result.python.modules}
+    real_target = str(target.resolve())
+    codes = [diagnostic.code for diagnostic in result.diagnostics if diagnostic.path == real_target]
+    assert codes == ["missing-import"]

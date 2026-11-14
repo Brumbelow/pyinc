@@ -139,6 +139,12 @@ def _workspace_path_allowed(
     ignored_dir_names: frozenset[str],
     exclude_globs: tuple[str, ...],
 ) -> bool:
+    """Whether the walk would reach `path`.
+
+    Each parent directory is tested by the rules the walk prunes a directory
+    by, so a glob that names a directory leaves out every file under it.
+    """
+
     try:
         relative = path.relative_to(root)
     except ValueError:
@@ -148,7 +154,9 @@ def _workspace_path_allowed(
     directory = root
     for part in relative.parts[:-1]:
         directory /= part
-        if _is_ignored_directory(directory, ignored_dir_names):
+        if _is_ignored_directory(directory, ignored_dir_names) or _is_excluded(
+            directory, root, exclude_globs
+        ):
             return False
     return not _is_excluded(path, root, exclude_globs)
 
@@ -626,8 +634,24 @@ class WorkspaceMirror:
         return self.mirror_root_path / Path(real_path).relative_to(self.root_path)
 
     def write_overlay(self, real_path: str, content: bytes) -> None:
-        """Put an editor buffer in the mirror in place of the file on disk."""
+        """Put an editor buffer in the mirror in place of the file on disk.
 
+        The mirror takes no buffer for a file the walk does not copy, as it
+        takes none for a file outside the root. Analyzed without the files
+        beside it, such a file would report imports of its siblings as missing.
+        """
+
+        source_path = Path(real_path)
+        if not _workspace_path_allowed(
+            source_path, self.root_path, self.ignored_dir_names, self.exclude_globs
+        ):
+            return
+        if not _is_relevant_file(source_path, self.root_path):
+            referenced = _requirements_reference_paths(
+                self.root_path, self.ignored_dir_names, self.exclude_globs
+            )
+            if source_path not in referenced:
+                return
         mirror_path = self.mirror_path_for_real(real_path)
         self._materialize_mirror_directory(mirror_path.parent)
         if mirror_path.is_dir():
