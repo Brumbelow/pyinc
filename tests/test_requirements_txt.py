@@ -519,7 +519,10 @@ def test_requirements_analysis_records_bare_url_and_path_lines_as_direct_referen
         "requests -r ./other.txt\n"
         "foo.tar.zip\n"
         "foo [bar] @ https://host/foo-1.0-py3-none-any.whl\n"
-        "foo [bar] @ https://host/x/y\n",
+        "foo [bar] @ https://host/x/y\n"
+        "foo (===1/2)\n"
+        "foo(===1/2)\n"
+        "foo[bar] (===1/2)\n",
         encoding="utf-8",
     )
 
@@ -545,6 +548,9 @@ def test_requirements_analysis_records_bare_url_and_path_lines_as_direct_referen
         (unspaced, f"@ {unspaced}", (), "", False),
         ("requests", "", (), "", False),
         ("foo_tar_zip", "", (), "", False),
+        ("foo", "(===1/2)", (), "", False),
+        ("foo", "(===1/2)", (), "", False),
+        ("foo", "(===1/2)", ("bar",), "", False),
     ]
     assert result.requirements[0].raw_line == wheel
     assert result.requirements[5].raw_line == "dist/pkg-2.0.tar.gz --hash=sha256:aaaa"

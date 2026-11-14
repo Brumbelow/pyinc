@@ -182,12 +182,14 @@ versions, or applies constraints recursively. Constraint references are
 recorded but not followed. Project-root escapes are diagnosed.
 A bare line is read as a path by its text alone, with no disk read: an archive
 suffix such as `.whl`, or a `/` or leading dot unless the line starts like a
-version specifier. The archive suffix is the last extension, with a `.tar`
+version specifier. A specifier in parentheses counts, so `foo (===1/2)` is the
+requirement `foo`. The archive suffix is the last extension, with a `.tar`
 before it, as pip takes it, so `foo.tar.zip` is a project name. A line whose
 text before its first `@` has no `/` and no leading dot is never a path,
-because pip reads it as `name @ url`. A backslash is not a separator, as for
-pip outside Windows, so a Windows path written with backslashes is read as a
-path only by an archive suffix or a leading dot.
+because pip reads it as `name @ url` when no file of that name exists. A
+backslash is not a separator, as for pip outside Windows, so a Windows path
+written with backslashes is read as a path only by an archive suffix or a
+leading dot.
 A direct reference takes no name from a wheel filename or an `#egg=` fragment.
 An abbreviated long option, which pip expands, is an `unparseable-line`, except
 one that starts with `--pre`, such as `--prefer`, which is skipped.

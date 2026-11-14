@@ -246,8 +246,11 @@ _ARCHIVE_SUFFIXES = (
     ".tar.lzma",
 )
 
-# A project name followed by a version operator starts a specifier.
-_SPECIFIER_START_PAT = r"^[A-Za-z0-9][A-Za-z0-9._-]*\s*(?:\[[^\]]*\])?\s*(?:[<>=!~]=|[<>])"
+# A project name followed by a version operator starts a specifier. PEP 508
+# allows parentheses around the specifier.
+_SPECIFIER_START_PAT = (
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*\s*(?:\[[^\]]*\])?\s*(?:\(\s*)?(?:[<>=!~]=|[<>])"
+)
 
 
 def _valid_file_reference_path(path: str) -> bool:
@@ -343,11 +346,12 @@ def _direct_reference(line: str) -> tuple[str, tuple[str, ...], str] | None:
     ``;``. pip reads the text before them as a file when it ends in an archive
     suffix, and as a directory when it holds a path separator or starts with
     a dot and that directory exists. A trailing ``[extras]`` on a path is kept
-    apart from it. When that text holds ``@`` and the part before the first
-    ``@`` does not look like a path, pip reads it as ``name @ url`` instead,
-    so it is ``None``. This parse reads text only, so it takes other text with
-    a separator or a leading dot as a directory unless it starts like a
-    version specifier. ``/`` is the one separator, as for pip outside Windows,
+    apart from it. When that text holds ``@``, the part before the first ``@``
+    does not look like a path, and no file of that name exists, pip reads it
+    as ``name @ url`` instead. This parse reads text only, so such text is
+    always ``None``, and it takes other text with a separator or a leading dot
+    as a directory unless it starts like a version specifier, in parentheses
+    or not. ``/`` is the one separator, as for pip outside Windows,
     so the answer is the same on every platform. pip reads a line that starts
     with ``-`` as options, so it is ``None``. Any other line is ``None`` too.
     """
