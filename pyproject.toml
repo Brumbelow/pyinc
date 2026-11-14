@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,16 +7,16 @@ name = "pyinc"
 version = "5.0.0"
 description = "A correctness-first incremental query engine for Python."
 readme = "README.md"
-requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
+requires-python = ">=3.11,<3.15"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
   { name = "Andrew Brumbelow", email = "andrew.brumbelow@gmail.com" }
 ]
 keywords = ["incremental-computation", "query-kernel", "salsa", "red-green", "backdating", "provenance"]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: Apache Software License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
@@ -69,6 +69,8 @@ include = [
   "/scripts",
   "/README.md",
   "/LICENSE",
+  "/SECURITY.md",
+  "/CONTRIBUTING.md",
   "/CHANGELOG.md",
   "/pyproject.toml",
 ]

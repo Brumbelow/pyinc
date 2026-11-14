@@ -41,6 +41,8 @@ def _validate_sdist(archive_path: Path, version: str) -> None:
     assert archive_path.name == f"pyinc-{version}.tar.gz"
     prefix = f"pyinc-{version}"
     required = {
+        f"{prefix}/CONTRIBUTING.md",
+        f"{prefix}/SECURITY.md",
         f"{prefix}/bench/README.md",
         f"{prefix}/bench/__init__.py",
         f"{prefix}/bench/harness.py",

@@ -304,8 +304,8 @@ def test_applicable_requirements_evaluates_the_markers(
     assert f"python_version = {sys.version_info.major}.{sys.version_info.minor}" in output
     assert f"Active interpreter: {sys.version.split()[0]}" in output
     # The example exists to show the marker arithmetic. Both of these markers
-    # are false on every interpreter the project supports (requires-python is
-    # >=3.11), and the two requirements whose markers hold are reported
+    # are false on every interpreter the project supports (requires-python
+    # starts at 3.11), and the two requirements whose markers hold are reported
     # applicable.
     assert re.search(r"backports-zoneinfo\s+False\s+not_applicable", output) is not None
     assert re.search(r"tomli\s+False\s+not_applicable", output) is not None

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -211,3 +212,42 @@ def test_main_reads_the_tagged_commit_and_reports_the_verdict(
 def test_main_reports_a_commit_that_lacks_the_release_files(tmp_path: Path) -> None:
     _git(tmp_path, "init", "--quiet")
     assert main(["--repository", str(tmp_path), "--tag", "v4.0.0", "--commit", "HEAD"]) == 1
+
+
+def _shipped_project() -> dict[str, Any]:
+    path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def test_the_supported_python_range_stops_before_3_15() -> None:
+    # Query identity reads bytecode and module metadata, and both change with
+    # every CPython release, so the range names only the releases tested.
+    project = _shipped_project()["project"]
+    classifiers = project["classifiers"]
+    versions = [
+        classifier.rsplit(" :: ", 1)[1]
+        for classifier in classifiers
+        if classifier.startswith("Programming Language :: Python :: 3.")
+    ]
+
+    assert project["requires-python"] == ">=3.11,<3.15"
+    assert versions == ["3.11", "3.12", "3.13", "3.14"]
+    assert "Development Status :: 5 - Production/Stable" in classifiers
+
+
+def test_the_license_is_an_spdx_expression_with_its_file() -> None:
+    document = _shipped_project()
+    project = document["project"]
+
+    assert project["license"] == "Apache-2.0"
+    assert project["license-files"] == ["LICENSE"]
+    assert not any(classifier.startswith("License ::") for classifier in project["classifiers"])
+    # hatchling 1.27 is the first release that writes License-Expression for
+    # this form. 1.26.3 writes the older License field.
+    assert document["build-system"]["requires"] == ["hatchling>=1.27"]
+
+
+def test_the_sdist_carries_the_security_and_contributing_guides() -> None:
+    sdist = _shipped_project()["tool"]["hatch"]["build"]["targets"]["sdist"]
+
+    assert {"/SECURITY.md", "/CONTRIBUTING.md"} <= set(sdist["include"])

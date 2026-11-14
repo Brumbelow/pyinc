@@ -182,6 +182,13 @@ narrow subset. Watcher loops, mirror workspaces, protocol-position conversion,
 and the LSP/JSON-RPC adapter belong to `pyinc_tools`. JSON Schema analysis
 belongs to `pyinc_codegen`. Neither widens the domain-agnostic kernel contract.
 
+Python 3.15 and later are out of scope. pyinc supports Python 3.11 to 3.14 and
+the free-threaded 3.14t build. Its `requires-python` is `>=3.11,<3.15`. Query
+identity reads bytecode and module metadata, and both change with every CPython
+minor release. A project that depends on pyinc and declares `requires-python`
+without an upper bound may need the same `<3.15` bound before its lock tool
+resolves.
+
 ## When should I not use pyinc?
 
 - Your function is a pure function of its arguments. Use
