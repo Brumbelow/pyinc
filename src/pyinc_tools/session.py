@@ -1173,8 +1173,9 @@ class WorkspaceSession:
         Offers bare-name, attribute (``module.``/``class.``), and import
         completions drawn from real symbol-table bindings. Runtime types are
         never inferred. Returns ``()`` when the caret is inside a string or
-        comment, outside the workspace, or otherwise has nothing sensible to
-        offer.
+        comment, or otherwise has nothing sensible to offer. Raises
+        ``ValueError`` for a path outside the workspace and
+        ``FileNotFoundError`` for a path in it that names no Python file.
         """
         return self._completion_list(path, line, character)[0]
 
@@ -3869,7 +3870,16 @@ class WorkspaceSession:
             for _, group_entries in config.optional_dependency_groups:
                 declared.extend(group_entries)
         if requirements is not None:
-            declared.extend(requirement.raw_line for requirement in requirements.requirements)
+            # A bare path or URL line keeps its target as the name and "@ "
+            # plus the target as its version text. An editable line keeps its
+            # path or URL as the name. Neither names a distribution, so the
+            # installed index has nothing to look up for it.
+            declared.extend(
+                requirement.raw_line
+                for requirement in requirements.requirements
+                if not requirement.is_editable
+                and requirement.version_spec != f"@ {requirement.name}"
+            )
 
         return _DependencyInputs(
             config=self._remap_config_analysis(config),

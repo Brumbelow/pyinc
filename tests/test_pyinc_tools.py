@@ -9958,3 +9958,49 @@ def test_undeclared_import_is_reported_against_a_manifest(
             "but that dependency is not declared.",
         )
     ]
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {},
+        {"pyproject.toml": '[project]\nname = "app"\nversion = "1"\ndependencies = []\n'},
+    ],
+    ids=["requirements-only", "with-pyproject"],
+)
+def test_requirements_path_and_url_lines_are_not_checked_as_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manifest: dict[str, str]
+) -> None:
+    # A path, URL or editable line names no distribution, so the installed
+    # index has nothing to look up for it. Only named requirements are
+    # checked. fakepkg is installed and pkg is not.
+    _install_fake_distribution(monkeypatch, tmp_path / "site-packages")
+    root = tmp_path / "workspace"
+    _write(root / "a.py", "x = 1\n")
+    _write(
+        root / "requirements.txt",
+        "./local_pkg\n"
+        "git+https://example.com/x/y.git\n"
+        "https://example.com/pkg-1.0.tar.gz\n"
+        "pkg @ https://example.com/pkg.whl\n"
+        "-e ./editable_pkg\n"
+        "--index-url=https://example.com/simple\n"
+        "fakepkg\n",
+    )
+    for name, text in manifest.items():
+        _write(root / name, text)
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_workspace()
+
+    assert [status.name for status in result.dependency_check.statuses] == ["pkg", "fakepkg"]
+    diagnostics = [
+        *result.diagnostics,
+        *(diagnostic for file in result.files for diagnostic in file.diagnostics),
+    ]
+    assert [
+        (Path(d.path).name, d.code, d.range.start.line if d.range else None, d.message)
+        for d in diagnostics
+    ] == [
+        ("requirements.txt", "dependency-missing", 3, "Declared dependency 'pkg' is not installed.")
+    ]
