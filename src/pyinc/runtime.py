@@ -10034,6 +10034,24 @@ class Database:
             active_ids.remove(object_id)
 
     def _is_resource_handle(self, value: Any) -> bool:
+        """True for a value the kernel folds and reads as a resource.
+
+        Its `label`, `probe` and `load` must be callable. A class whose hooks
+        are plain functions, in its own namespace or a base's, is a resource
+        class. Its hooks run on an instance, so the class folds as a class.
+        A class whose hooks are classmethods, staticmethods or methods of its
+        metaclass runs them on the class itself, so it is a handle.
+        `explain._is_resource_handle` makes the same test.
+        """
+
+        if isinstance(value, type):
+            for name in ("label", "probe", "load"):
+                for klass in value.__mro__:
+                    namespace = vars(klass)
+                    if name in namespace:
+                        if isinstance(namespace[name], FunctionType):
+                            return False
+                        break
         return all(callable(getattr(value, name, None)) for name in ("label", "probe", "load"))
 
     @contextmanager

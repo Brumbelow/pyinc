@@ -71,6 +71,16 @@ def format_explanation(root: InspectionNode) -> str:
 
 
 def _is_resource_handle(value: Any) -> bool:
+    """The test `Database._is_resource_handle` makes, so a resource class reports as a type."""
+
+    if isinstance(value, type):
+        for name in ("label", "probe", "load"):
+            for klass in value.__mro__:
+                namespace = vars(klass)
+                if name in namespace:
+                    if isinstance(namespace[name], FunctionType):
+                        return False
+                    break
     return all(callable(getattr(value, name, None)) for name in ("label", "probe", "load"))
 
 
