@@ -1334,14 +1334,31 @@ def _resolve_qualified_name(
     qualified_name = payload[9][-1].rsplit(":", 1)[1]
     name = qualified_name.rsplit(".", 1)[-1]
     lexical = scope_tree(db, decoded.defining_path)
-    source_range = next(
-        (
-            binding.range
-            for binding in lexical.bindings
-            if binding.name == name and binding.range.start.line == defining_lineno - 1
-        ),
-        None,
-    )
+    if "." in qualified_name:
+        # A class member is matched to the binding of its name on the line
+        # the symbol table records.
+        source_range = next(
+            (
+                binding.range
+                for binding in lexical.bindings
+                if binding.name == name and binding.range.start.line == defining_lineno - 1
+            ),
+            None,
+        )
+    else:
+        # A top-level name has one module-scope binding, and its range is the
+        # first place the file binds the name. That place can sit on another
+        # line than the recorded statement: a function binds the name first
+        # through `global`, a loop binds it first, or it is a target on a
+        # continuation line.
+        source_range = next(
+            (
+                binding.range
+                for binding in lexical.bindings
+                if binding.scope_id == "module" and binding.name == name
+            ),
+            None,
+        )
     return replace(decoded, qualified_name=qualified_name, range=source_range)
 
 

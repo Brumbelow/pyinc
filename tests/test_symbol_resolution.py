@@ -1918,9 +1918,88 @@ def test_symbol_at_never_confuses_same_named_bindings_in_the_defining_file(
         assert (resolved.scope_id, resolved.name) == ("module", "t")
         assert resolved.declaration == expected
     # The symbol table records `late` on the line where its statement starts,
-    # and the name sits on the next line. With no binding on the recorded
-    # line, the answer is None and never the local `late` in `other`.
-    assert symbol_at(db, root, late_user, SourcePosition(2, 0)) is None
+    # and the name sits on the next line. The answer is the module binding of
+    # `late` and never the local `late` in `other`.
+    resolved = symbol_at(db, root, late_user, SourcePosition(2, 0))
+    assert resolved is not None
+    assert (resolved.scope_id, resolved.name) == ("module", "late")
+    assert resolved.declaration == SourceRange(SourcePosition(15, 4), SourcePosition(15, 8))
+
+
+# A module-level name whose first binding sits on another line than the
+# statement the symbol table records: bound first in a function through
+# `global`, bound first by a loop, and a target on a continuation line. Each
+# entry holds the source of a.py, the start of that first binding, and the
+# references in a.py as (line, character, is_declaration).
+_FIRST_BOUND_ELSEWHERE = {
+    "global": (
+        "def init() -> None:\n    global CONFIG\n    CONFIG = 1\n\n\nCONFIG = None\n",
+        (2, 4),
+        [(1, 11, False), (2, 4, True), (5, 0, False)],
+    ),
+    "loop": (
+        "for CONFIG in range(3):\n    pass\n\nCONFIG = None\n",
+        (0, 4),
+        [(0, 4, True), (3, 0, False)],
+    ),
+    "continuation": (
+        "FIRST, \\\n    CONFIG = 1, 2\n",
+        (1, 4),
+        [(1, 4, True)],
+    ),
+}
+
+
+def _write_first_bound_elsewhere(root: Path, defining_source: str) -> None:
+    root.mkdir()
+    (root / "a.py").write_text(defining_source, encoding="utf-8")
+    (root / "b.py").write_text("import a\n\na.CONFIG\n", encoding="utf-8")
+    (root / "c.py").write_text("from a import CONFIG\n\nCONFIG\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("shape", sorted(_FIRST_BOUND_ELSEWHERE))
+def test_symbol_at_from_another_file_finds_a_module_name_bound_first_on_another_line(
+    tmp_path: Path, shape: str
+) -> None:
+    defining_source, (line, character), _ = _FIRST_BOUND_ELSEWHERE[shape]
+    root = tmp_path / "workspace"
+    _write_first_bound_elsewhere(root, defining_source)
+
+    db = Database(mode="strict")
+    expected = SourceRange(
+        SourcePosition(line, character), SourcePosition(line, character + len("CONFIG"))
+    )
+    local = symbol_at(db, root, root / "a.py", SourcePosition(line, character))
+    assert local is not None
+    assert (local.scope_id, local.name, local.declaration) == ("module", "CONFIG", expected)
+    assert symbol_at(db, root, root / "b.py", SourcePosition(2, 2)) == local
+    assert symbol_at(db, root, root / "c.py", SourcePosition(2, 0)) == local
+    resolved = resolve_symbol(db, root, root / "c.py", "CONFIG")
+    assert (resolved.defining_path, resolved.range) == (str(root / "a.py"), expected)
+
+
+@pytest.mark.parametrize("shape", sorted(_FIRST_BOUND_ELSEWHERE))
+def test_find_references_from_another_file_reach_a_module_name_bound_first_on_another_line(
+    tmp_path: Path, shape: str
+) -> None:
+    defining_source, (line, character), defining_file = _FIRST_BOUND_ELSEWHERE[shape]
+    root = tmp_path / "workspace"
+    _write_first_bound_elsewhere(root, defining_source)
+
+    db = Database(mode="strict")
+    target = symbol_at(db, root, root / "a.py", SourcePosition(line, character))
+    assert target is not None
+    result = find_references_by_id(db, root, target)
+
+    found = [
+        (Path(r.path).name, r.range.start.line, r.range.start.character, r.is_declaration)
+        for r in result.references
+    ]
+    assert found == [
+        *(("a.py", *reference) for reference in defining_file),
+        ("b.py", 2, 2, False),
+        ("c.py", 2, 0, False),
+    ]
 
 
 def test_find_references_counts_uses_spelled_with_an_alias(tmp_path: Path) -> None:

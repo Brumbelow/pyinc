@@ -3170,6 +3170,65 @@ def test_rename_symbol_leaves_uses_spelled_with_an_alias(tmp_path: Path) -> None
     assert (root / "b.py").read_text() == "from a import bar, bar as f\n\nbar()\nf()\n"
 
 
+def test_rename_symbol_rewrites_other_files_for_a_name_a_function_binds_first(
+    tmp_path: Path,
+) -> None:
+    # `init` binds CONFIG through `global` before the module-level assignment
+    # the symbol table records.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def init():\n    global CONFIG\n    CONFIG = 1\n\n\nCONFIG = None\n")
+    _write(root / "b.py", "import a\n\na.CONFIG\n")
+    _write(root / "c.py", "from a import CONFIG\n\nCONFIG\n")
+
+    with WorkspaceSession(root) as session:
+        target = _symbol_for_name(session, root / "a.py", "CONFIG = 1")
+        result = session.rename_symbol(target, "renamed")
+        assert result.status == "ok"
+        assert [(Path(edit.path).name, edit.range) for edit in result.edits] == [
+            ("a.py", _range(1, 11, 1, 17)),
+            ("a.py", _range(2, 4, 2, 10)),
+            ("a.py", _range(5, 0, 5, 6)),
+            ("b.py", _range(2, 2, 2, 8)),
+            ("c.py", _range(0, 14, 0, 20)),
+            ("c.py", _range(2, 0, 2, 6)),
+        ]
+        _apply_rename_edits(result.edits)
+
+    assert (root / "a.py").read_text() == (
+        "def init():\n    global renamed\n    renamed = 1\n\n\nrenamed = None\n"
+    )
+    assert (root / "b.py").read_text() == "import a\n\na.renamed\n"
+    assert (root / "c.py").read_text() == "from a import renamed\n\nrenamed\n"
+
+
+def test_rename_symbol_rewrites_other_files_for_a_target_on_a_continuation_line(
+    tmp_path: Path,
+) -> None:
+    # The symbol table records SECOND on the line where its statement starts.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "FIRST, \\\n    SECOND = 1, 2\n")
+    _write(root / "b.py", "import a\n\na.SECOND\n")
+    _write(root / "c.py", "from a import SECOND\n\nSECOND\n")
+
+    with WorkspaceSession(root) as session:
+        target = _symbol_for_name(session, root / "a.py", "SECOND")
+        result = session.rename_symbol(target, "renamed")
+        assert result.status == "ok"
+        assert [(Path(edit.path).name, edit.range) for edit in result.edits] == [
+            ("a.py", _range(1, 4, 1, 10)),
+            ("b.py", _range(2, 2, 2, 8)),
+            ("c.py", _range(0, 14, 0, 20)),
+            ("c.py", _range(2, 0, 2, 6)),
+        ]
+        _apply_rename_edits(result.edits)
+
+    assert (root / "a.py").read_text() == "FIRST, \\\n    renamed = 1, 2\n"
+    assert (root / "b.py").read_text() == "import a\n\na.renamed\n"
+    assert (root / "c.py").read_text() == "from a import renamed\n\nrenamed\n"
+
+
 def test_rename_symbol_rewrites_attribute_access_through_module_import(
     tmp_path: Path,
 ) -> None:
