@@ -85,7 +85,7 @@ configuration after `initialize`, and does not cancel work on
 | Broken headers | `-32700` Parse error, then the server exits with status 1. |
 | A request the server refuses on its parameters, such as a missing URI or a position outside the document | `-32602` Invalid params. |
 | A request the server cannot carry out, such as a rename from an alias occurrence | `-32803` RequestFailed, with a message that says why. |
-| A handler that raises | `-32603` Internal error for a request. The traceback goes to stderr, and the server keeps serving. |
+| A handler that raises | `-32603` Internal error for a request. The traceback goes to stderr, and the server keeps serving. Semantic tokens and inlay hints answer this way for a file whose expressions nest too deeply for the interpreter's stack, such as a chain of a thousand additions. |
 | `exit` without `shutdown` | The server exits with status 1. |
 
 `initialize` fails with `-32803` RequestFailed when the root is the home

@@ -64,7 +64,8 @@ and indexed, because import resolution and the dependency check read every
 module. A `--path` that is not an existing file exits `1`. A `--path` that
 names a file the mirror does not copy, such as a non-Python file other than
 the root manifests or a file under a skipped directory, prints a result with a
-null `module`, null `symbols`, and no diagnostics.
+null `module`, null `symbols`, and no diagnostics, so a `--fail-on` gate
+passes on it.
 
 A workspace may hold at most 1,000 Python and manifest files, and a larger one
 exits `1`. `--max-files N` raises the limit. It takes an integer of at least 1,
@@ -138,9 +139,12 @@ No code reports `information`. `undeclared-import` is reported only when the
 root holds a `requirements.txt` or a `pyproject.toml` with a `[project]`
 table. A `[project]` table with `dynamic = ["dependencies"]` and no
 `requirements.txt` lists no dependencies, so each installed import gets the
-diagnostic unless an optional dependency group names it. `unused-import`
-checks only `from` imports of workspace modules, and never in an `__init__.py`
-file. It skips a file that does not parse, a star import, a
+diagnostic unless an optional dependency group names it. Dependencies listed
+only under `[dependency-groups]` are not read, so an import they cover gets
+the diagnostic too.
+
+`unused-import` checks only `from` imports of workspace modules, and never in
+an `__init__.py` file. It skips a file that does not parse, a star import, a
 `from m import x as x` re-export, a name in the module's `__all__`, and a name
 another workspace module imports from it.
 
@@ -322,8 +326,8 @@ It also skips paths that match the exclusion globs. A link inside the root is
 skipped wherever the walk meets one: a linked file, a linked directory, a
 Windows junction, a dangling link such as the lock file Emacs writes beside a
 modified buffer, and a linked requirements file. A link whose target lies
-outside the root refuses the workspace. Avoid renaming a workspace root while
-a session is synchronizing it.
+outside the root refuses the workspace, and so does a file the process cannot
+read. Avoid renaming a workspace root while a session is synchronizing it.
 
 All public source ranges are zero-based and end-exclusive. Library positions
 count Unicode code points. The LSP boundary converts them to the encoding
