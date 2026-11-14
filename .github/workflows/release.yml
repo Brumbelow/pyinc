@@ -11,6 +11,8 @@ permissions:
 jobs:
   gates:
     uses: ./.github/workflows/ci.yml
+    with:
+      full_matrix: true
 
   codeql:
     permissions:

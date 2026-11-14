@@ -5,14 +5,64 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
+    inputs:
+      full_matrix:
+        description: Run the suite unsharded on every operating system and interpreter
+        type: boolean
+        default: false
   workflow_call:
+    inputs:
+      full_matrix:
+        description: Run the suite unsharded on every operating system and interpreter
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }}, shard ${{ matrix.shard }}/4)
+    if: ${{ !inputs.full_matrix }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.11', '3.14']
+        shard: [1, 2, 3, 4]
+        exclude:
+          - os: windows-latest
+            python-version: '3.11'
+          - os: macos-latest
+            python-version: '3.11'
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -c constraints.txt -e '.[dev]'
+
+      - name: Run test suite
+        # Each cell runs as four jobs. PYINC_TEST_SHARD keeps the quarter of
+        # the tests whose node id digest falls in this shard (tests/conftest.py).
+        # The process tests check the repository as shipped and are platform
+        # independent, so the quality job runs them once.
+        env:
+          PYINC_TEST_SHARD: ${{ matrix.shard }}/4
+        run: pytest -n auto --dist load -m 'not process' --ignore=tests/test_properties.py --tb=short -rfEs
+
+  test-full:
     name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    if: ${{ inputs.full_matrix }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -60,23 +110,19 @@ jobs:
           print(sys.version)
           PY
 
-      - name: Probe artifact-store process contention
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          for attempt in {1..8}; do
-            echo "Artifact-store canary attempt ${attempt}/8"
-            python -m pytest -q --tb=long tests/test_store.py::test_filesystem_store_refuses_cross_process_conflicting_bytes
-          done
-
       - name: Run test suite
         # The process tests check the repository as shipped and are platform
-        # independent, so the quality job runs them once instead of fifteen times.
-        run: pytest -q -n auto --dist load -m 'not process' --ignore=tests/test_properties.py
+        # independent, so the quality job runs them once.
+        run: pytest -n auto --dist load -m 'not process' --ignore=tests/test_properties.py --tb=short -rfEs
 
   test-properties:
-    name: Properties (ubuntu-latest, Python 3.14, strict)
+    name: Properties (ubuntu-latest, Python 3.14, strict, shard ${{ matrix.shard }}/3)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -91,7 +137,8 @@ jobs:
           python -m pip install -c constraints.txt -e '.[dev]'
 
       - name: Run property suite
-        # One shard at a reduced example budget on every push and pull request.
+        # The strict mode at a reduced example budget on every push and pull
+        # request, as three jobs split by PYINC_TEST_SHARD (tests/conftest.py).
         # The full matrix at the written budgets runs nightly. Every case is
         # parametrized over the three modes, with the mode as the last parameter
         # in the identifier. The closing bracket keeps a case whose own name
@@ -99,10 +146,11 @@ jobs:
         shell: bash
         env:
           PYINC_PROPERTY_MAX_EXAMPLES: '10'
-        run: python -m pytest -q -n auto --dist load -k "strict]" tests/test_properties.py
+          PYINC_TEST_SHARD: ${{ matrix.shard }}/3
+        run: python -m pytest -n auto --dist load -k "strict]" tests/test_properties.py --tb=short -rfEs
 
   quality:
-    name: Static analysis and coverage
+    name: Static analysis and process tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -130,10 +178,10 @@ jobs:
       - name: Check documentation
         run: python scripts/check_docs.py
 
-      - name: Run the full suite with branch coverage
-        # Everything but the property suite, process tests included. The
-        # coverage report is informational and has no floor.
-        run: pytest -n auto --dist load --ignore=tests/test_properties.py --cov=pyinc --cov=pyinc_codegen --cov=pyinc_tools --cov-branch --cov-report=term-missing
+      - name: Run the process tests
+        # The tests that check the repository as shipped. The test jobs skip
+        # them, because they give the same result on every platform.
+        run: python -m pytest -n auto --dist load -m process --tb=short -rfEs
 
   distribution:
     name: Build and validate installed artifacts
