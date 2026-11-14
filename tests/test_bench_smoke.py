@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -12,7 +13,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from bench import harness  # noqa: E402
+from bench import harness, overhead  # noqa: E402
 from bench.baselines import FIXED_COMPARATORS, required_comparators  # noqa: E402
 from bench.measure import ScenarioResult  # noqa: E402
 
@@ -184,3 +185,33 @@ def test_authoritative_work_gate_checks_removal_backdates_and_resource_loads() -
     results[index] = replace(results[index], query_backdates=0, resource_loads=2)
     with pytest.raises(AssertionError, match="query_backdates expected 7"):
         harness.validate_repetition(results)
+
+
+_DURATION = r"\d+\.\d{2} (?:ns|us|ms|s)"
+_OVERHEAD_LINE = re.compile(
+    rf"(?P<label>[a-z-]+/[a-z-]+): \d+\.\d{{2}}x \({_DURATION} / {_DURATION}\)(?P<rest>.*)"
+)
+
+
+def test_overhead_script_prints_five_same_run_ratios(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("import json\n\nVALUE = json.dumps(1)\n", encoding="utf-8")
+
+    overhead.main(["--root", str(workspace), "--repeat", "1"])
+
+    lines = capsys.readouterr().out.splitlines()
+    matches = [_OVERHEAD_LINE.fullmatch(line) for line in lines]
+    assert all(matches), lines
+    assert [match.group("label") for match in matches if match] == [
+        "warm-get/lru-cache-hit",
+        "tracked-read/open-read",
+        "evaluated-annotation/future-annotation",
+        "cold-analysis/no-change-analysis",
+        "memo-off-read/memo-on-read",
+    ]
+    rests = [match.group("rest") for match in matches if match]
+    assert re.fullmatch(r", query executions in the no-change run: \d+", rests[3]), rests[3]
+    assert rests[:3] + rests[4:] == ["", "", "", ""]
