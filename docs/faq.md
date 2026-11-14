@@ -12,10 +12,8 @@ and does not implement Adapton's algorithm. The lineage is in the idea, and the
 idea has a Python history of its own.
 [IncPy](https://www.usenix.org/conference/tapp-10/towards-practical-incremental-recomputation-scientists-implementation-python)
 explored it in 2010, [Adapton](https://plum-umd.github.io/adapton/) listed a
-Python implementation, and [Loman](https://pypi.org/project/loman/),
-[Darl](https://pypi.org/project/darl/), and
-[Cascade Query](https://github.com/hmatt1/cascade-query) each cover parts of
-this ground.
+Python implementation, and [Loman](https://pypi.org/project/loman/) covers
+parts of this ground.
 
 The graph algorithm is the familiar one. The differences that matter are in
 what a Python implementation has to enforce at runtime:

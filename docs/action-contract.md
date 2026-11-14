@@ -96,11 +96,26 @@ write.
 ## Locking, publication, and recovery
 
 Advisory cross-process locks protect the full preflight, write, delete, and
-manifest sequence. The locks are keyed by the resolved root, state directory,
-and full tool identity. The default timeout is 30 seconds. Set it on the
-decorator or on each call. A timeout raises `ActionLockTimeoutError`. A
-symlink, non-regular lock target, or other unsafe lock path raises
-`ActionPathError` before any desired output is evaluated or mutated.
+manifest sequence. A reconcile takes two locks: one keyed by the resolved root
+and the full tool identity, one keyed by the resolved state directory and the
+tool identity. When the two paths are equal it takes one. Each lock file is
+named by a SHA-256 digest of its path and the tool. The path is NFC-normalized
+and case-folded first, so paths that differ only in case share a lock. The
+default timeout is 30 seconds. Set it on the decorator or on each call. A
+timeout raises `ActionLockTimeoutError`. A symlink, non-regular lock target,
+or other unsafe lock path raises `ActionPathError` before any desired output
+is evaluated or mutated.
+
+The lock files live in a per-user directory under the resolved
+`tempfile.gettempdir()`. On POSIX the directory is `pyinc-action-locks-<uid>`.
+Windows has no `os.getuid`, so there the suffix is the first 16 hex digits of
+a SHA-256 digest of the home directory path. On POSIX, a lock directory owned
+by another user raises `ActionPathError`, and one with group or other
+permission bits is reset to mode `0o700`. `tempfile.gettempdir()` reads
+`TMPDIR`, `TEMP` and `TMP`. Processes exclude each other only when they run as
+the same user and resolve the same temporary directory. Containers or CI jobs
+that reconcile one root must run as one user and share one temporary
+directory.
 
 Changed files are flushed to temporary files in the same directory and
 published atomically.
