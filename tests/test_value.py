@@ -1346,26 +1346,40 @@ def test_deserialize_rejects_trailing_garbage() -> None:
         deserialize_snapshot(payload + b"junk")
 
 
-# A wall-clock ratio, so the cross-platform matrix skips it with the other
-# process tests and the quality job runs it once.
+# A timing ratio, so the cross-platform matrix skips it with the other
+# process tests and the quality job runs it once. It reads the thread's CPU
+# time, so time spent waiting behind other workers does not count.
 @pytest.mark.process
 def test_snapshot_decode_time_grows_linearly_with_payload_size() -> None:
-    def best_decode_seconds(count: int) -> float:
+    def payload_of(count: int) -> bytes:
         snapshot = freeze(tuple(f"item-{index:015d}" for index in range(count)))
         payload = serialize_snapshot(snapshot)
-        best = float("inf")
-        for _ in range(3):
-            started = time.perf_counter()
-            decoded = deserialize_snapshot(payload)
-            best = min(best, time.perf_counter() - started)
-            assert decoded == snapshot
-        return best
+        assert deserialize_snapshot(payload) == snapshot
+        return payload
 
-    small = best_decode_seconds(4_000)
-    large = best_decode_seconds(32_000)
-    # Eight times the items costs about eight times the time when decoding is
-    # linear. A decoder that rescans the payload per segment grows about 70x.
-    assert large / small < 24, f"4,000 items {small:.4f}s, 32,000 items {large:.4f}s"
+    def cpu_seconds(payload: bytes, decodes: int) -> float:
+        started = time.thread_time()
+        for _ in range(decodes):
+            deserialize_snapshot(payload)
+        return time.thread_time() - started
+
+    small_payload = payload_of(4_000)
+    large_payload = payload_of(32_000)
+    # Both legs decode 96,000 items, so each runs for about 50 ms even on a
+    # fast machine. That is several of the 16 ms steps in which Windows
+    # reports CPU time.
+    small = large = float("inf")
+    for _ in range(3):
+        small = min(small, cpu_seconds(small_payload, 24))
+        large = min(large, cpu_seconds(large_payload, 3))
+    # Linear decoding takes about the same time for both legs. A decoder that
+    # copies the payload per segment takes 8 to 10 times as long on the large
+    # payload. A leg under 20 ms counts as 20 ms, so a leg that reads 0 cannot
+    # divide by zero or decide the result.
+    ratio = max(large, 0.02) / max(small, 0.02)
+    assert ratio < 3, (
+        f"24 decodes of 4,000 items {small:.4f}s, 3 decodes of 32,000 items {large:.4f}s"
+    )
 
 
 def test_snapshot_validation_rejects_invalid_graphs_and_excessive_depth() -> None:
