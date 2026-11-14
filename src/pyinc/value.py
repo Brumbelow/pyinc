@@ -1281,7 +1281,9 @@ def deserialize_snapshot(payload: bytes) -> Snapshot:
             f"Payload does not carry the expected kernel fingerprint version prefix {_KERNEL_FINGERPRINT_PREFIX!r}."
         )
     try:
-        snapshot, offset = _decode_snapshot(memoryview(payload), len(_KERNEL_FINGERPRINT_PREFIX))
+        # One bytes copy of the buffer, which every segment read searches from
+        # its offset, so decoding stays linear in the payload size.
+        snapshot, offset = _decode_snapshot(bytes(memoryview(payload)), len(_KERNEL_FINGERPRINT_PREFIX))
     except (IndexError, OverflowError, RecursionError, UnicodeError, ValueError) as exc:
         raise UnsupportedValueError("Payload contains an invalid snapshot encoding.") from exc
     if offset != len(payload):
@@ -1441,7 +1443,7 @@ def _encode_snapshot(value: Any, buf: bytearray) -> None:
     )
 
 
-def _decode_snapshot(buf: memoryview, offset: int) -> tuple[Snapshot, int]:
+def _decode_snapshot(buf: bytes, offset: int) -> tuple[Snapshot, int]:
     """Inverse of `_encode_snapshot`. Returns the decoded snapshot and the new offset."""
     tag = bytes(buf[offset : offset + 1])
     if tag == b"N":
@@ -1556,16 +1558,16 @@ def _decode_snapshot(buf: memoryview, offset: int) -> tuple[Snapshot, int]:
     raise UnsupportedValueError(f"Unknown snapshot tag {tag!r} at offset {offset}.")
 
 
-def _expect(buf: memoryview, offset: int, expected: bytes) -> None:
+def _expect(buf: bytes, offset: int, expected: bytes) -> None:
     if bytes(buf[offset : offset + len(expected)]) != expected:
         raise UnsupportedValueError(
             f"Expected {expected!r} at offset {offset}, got {bytes(buf[offset : offset + len(expected)])!r}."
         )
 
 
-def _read_length_prefixed(buf: memoryview, offset: int) -> tuple[bytes, int]:
+def _read_length_prefixed(buf: bytes, offset: int) -> tuple[bytes, int]:
     """Read an `<int>:<bytes>` segment. Returns (body, offset_after_body)."""
-    sep = bytes(buf).find(b":", offset)
+    sep = buf.find(b":", offset)
     if sep == -1:
         raise UnsupportedValueError(f"Missing ':' length separator at offset {offset}.")
     length = int(bytes(buf[offset:sep]).decode("ascii"))
@@ -1573,9 +1575,9 @@ def _read_length_prefixed(buf: memoryview, offset: int) -> tuple[bytes, int]:
     return bytes(buf[sep + 1 : end]), end
 
 
-def _read_length_prefixed_int(buf: memoryview, offset: int) -> tuple[int, int]:
+def _read_length_prefixed_int(buf: bytes, offset: int) -> tuple[int, int]:
     """Read an `<int>:` count prefix (no body bytes). Returns (count, offset_after_colon)."""
-    sep = bytes(buf).find(b":", offset)
+    sep = buf.find(b":", offset)
     if sep == -1:
         raise UnsupportedValueError(f"Missing ':' length separator at offset {offset}.")
     return int(bytes(buf[offset:sep]).decode("ascii")), sep + 1

@@ -6,6 +6,7 @@ import random
 import re
 import struct
 import sys
+import time
 from collections.abc import Iterator
 from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
@@ -1343,6 +1344,28 @@ def test_deserialize_rejects_trailing_garbage() -> None:
     payload = serialize_snapshot(freeze(42))
     with pytest.raises(UnsupportedValueError, match="trailing"):
         deserialize_snapshot(payload + b"junk")
+
+
+# A wall-clock ratio, so the cross-platform matrix skips it with the other
+# process tests and the quality job runs it once.
+@pytest.mark.process
+def test_snapshot_decode_time_grows_linearly_with_payload_size() -> None:
+    def best_decode_seconds(count: int) -> float:
+        snapshot = freeze(tuple(f"item-{index:015d}" for index in range(count)))
+        payload = serialize_snapshot(snapshot)
+        best = float("inf")
+        for _ in range(3):
+            started = time.perf_counter()
+            decoded = deserialize_snapshot(payload)
+            best = min(best, time.perf_counter() - started)
+            assert decoded == snapshot
+        return best
+
+    small = best_decode_seconds(4_000)
+    large = best_decode_seconds(32_000)
+    # Eight times the items costs about eight times the time when decoding is
+    # linear. A decoder that rescans the payload per segment grows about 70x.
+    assert large / small < 24, f"4,000 items {small:.4f}s, 32,000 items {large:.4f}s"
 
 
 def test_snapshot_validation_rejects_invalid_graphs_and_excessive_depth() -> None:
