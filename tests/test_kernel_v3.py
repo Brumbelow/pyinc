@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import decimal
+import dis
 import functools
 import hashlib
 import importlib
@@ -6660,3 +6661,89 @@ def test_a_stat_reading_survives_every_placement(
     else:
         assert result[0] == expected
         assert result[1][0] == expected
+
+
+def _query_after_many_names(
+    namespace: dict[str, Any], capture: str, attribute: str, *, key: str
+) -> Query[..., Any]:
+    """Build a query that names 300 attributes before returning one chain.
+
+    An operand past one byte carries an EXTENDED_ARG prefix, and dis yields
+    that prefix as an instruction of its own. On 3.12 and later the attribute
+    load shifts the name index left by one, so the prefix appears from index
+    128. On 3.11 it appears from index 256. 300 names put the final chain past
+    both on every supported version.
+    """
+
+    lines = ["def raw(db: Database) -> object:", "    if db is None:"]
+    lines.extend(f"        db.unused_{index}" for index in range(300))
+    lines.append(f"    return {capture}.{attribute}")
+    exec(
+        compile("\n".join(lines) + "\n", "<many-names>", "exec", dont_inherit=True),
+        namespace,
+    )
+    raw = cast(FunctionType, namespace["raw"])
+    instructions = list(dis.get_instructions(raw))
+    position = next(
+        index
+        for index, instruction in enumerate(instructions)
+        if instruction.opname == "LOAD_ATTR" and instruction.argval == attribute
+    )
+    # The shape the chain walk must read through. Without the prefix this
+    # query proves nothing.
+    assert instructions[position - 1].opname == "EXTENDED_ARG"
+    return Query(raw, key=key)
+
+
+def test_a_stdlib_constant_read_after_many_names_moves_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The chain walk reads through an EXTENDED_ARG prefix.
+
+    The walk that finds `string.digits` used to stop at the prefix in front of
+    the attribute load. The path was lost, the constant was not folded, and a
+    rebound constant left identity where it was. The warm database served the
+    old digits while a fresh one read the new ones.
+    """
+
+    digits = _query_after_many_names(
+        {"Database": Database, "string": string},
+        "string",
+        "digits",
+        key="stdlib-constant-after-many-names",
+    )
+    db = Database()
+    assert db.get(digits) == "0123456789"
+    monkeypatch.setattr(string, "digits", "XYZ")
+    _assert_warm_matches_fresh(db, "strict", digits, "XYZ")
+
+
+def test_a_module_attribute_read_after_many_names_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user module read after an EXTENDED_ARG prefix is a static access.
+
+    With the path lost at the prefix, the walk saw a bare use of the module and
+    refused the query as one that uses its module dynamically. Read through the
+    prefix, the access is folded as any other, and a rebound attribute moves
+    identity.
+    """
+
+    module_name = "pyinc_many_names_settings"
+    (tmp_path / f"{module_name}.py").write_text("SCALE = 1\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+        scale = _query_after_many_names(
+            {"Database": Database, "settings": module},
+            "settings",
+            "SCALE",
+            key="module-attribute-after-many-names",
+        )
+        db = Database()
+        assert db.get(scale) == 1
+        monkeypatch.setattr(module, "SCALE", 5)
+        _assert_warm_matches_fresh(db, "strict", scale, 5)
+    finally:
+        sys.modules.pop(module_name, None)

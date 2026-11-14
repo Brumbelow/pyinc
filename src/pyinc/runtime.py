@@ -7862,10 +7862,16 @@ class Database:
                     continue
                 path: list[str] = []
                 cursor = index + 1
-                while cursor < len(instructions) and instructions[cursor].opname in {
-                    "LOAD_ATTR",
-                    "LOAD_METHOD",
-                }:
+                while cursor < len(instructions):
+                    opname = instructions[cursor].opname
+                    if opname in {"EXTENDED_ARG", "CACHE"}:
+                        # A prefix carries the high bytes of the next operand,
+                        # which dis has already folded into that argval. A
+                        # cache entry is inline data. Neither ends the chain.
+                        cursor += 1
+                        continue
+                    if opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
+                        break
                     attribute = instructions[cursor].argval
                     if not isinstance(attribute, str):
                         dynamic = True
