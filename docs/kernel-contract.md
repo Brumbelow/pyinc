@@ -575,6 +575,13 @@ and submodules pin their defining modules transitively. Dynamic access to a
 custom module is rejected when the behavior cannot be proven. Rebinding a
 statically captured module attribute, or an entry in a directly captured class
 body, moves query identity at the next request, warm or fresh alike.
+That holds for a rebinding made between requests, so rebind module state
+there. When another thread rebinds an attribute while a request computes its
+fingerprint or runs the query, the new value can be folded under the old
+value's identity. A warm database then gives the old value's answer until the
+module changes again. The rebinding can instead store the new value's
+answer under the old identity, which a warm database serves each time the old
+value returns.
 
 Where the interpreter exposes no Python evaluator to observe (a `type` alias
 before 3.14, a runtime-constructed `TypeVar`'s bound), the payload anchors
@@ -582,7 +589,7 @@ each class it reaches to its live module binding. Rebinding such a binding, a
 base, a metaclass, or a directly bound body class then refuses loudly instead
 of moving identity.
 
-Five shapes escape this tracking. Route such state through an `Input` or a
+Six shapes escape this tracking. Route such state through an `Input` or a
 `Resource`:
 
 - A chain that lands on a class or a frozen dataclass instance, named directly
@@ -601,6 +608,15 @@ Five shapes escape this tracking. Route such state through an `Input` or a
 - Outside the standard library, a module that stores a process id, an import
   timestamp, or anything derived from them at module scope makes every
   identity that captures it process-varying.
+- The kernel recognizes a standard-library class and a body import by the
+  top-level module name in `sys.stdlib_module_names`. So a project's own
+  `calendar.py`, `queue.py` or `profile.py` passes for the standard-library
+  module. A class defined there that a query calls, or that a class has as a
+  base, is pinned as a standard-library class is, and its body is never read.
+  Rebinding an entry in its body then leaves a warm answer in place. A
+  query body's import of such a module is accepted and stays out of identity
+  (next shape). Give the module another name, or move that import to module
+  scope, where a captured module is judged by where its file lives.
 - A module a body reaches without capturing it stays out of the fold: one a
   standard-library import statement binds in the body (condition 3), or one
   reached through `sys.modules[name]`, `importlib.import_module(name)` or
