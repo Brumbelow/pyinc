@@ -292,7 +292,7 @@ def test_consumer_surface_check_reports_disagreement_in_both_directions(tmp_path
 
 
 def test_the_documents_name_many_external_links() -> None:
-    """The scheduled link check tests every address collected here. A narrowed harvest would pass silently."""
+    """The link check workflow tests every address collected here. A narrowed harvest would pass silently."""
     urls = external_urls(markdown_files(PROJECT_ROOT))
 
     distinct = set(urls)

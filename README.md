@@ -68,7 +68,7 @@ the clips, the full provenance, and the deterministic work counts.
 - [Integration contract](https://github.com/Brumbelow/pyinc/blob/main/docs/integration-contract.md): stable entrypoints, result types, supported shapes, and limits.
 - [`pyinc-tools` guide](https://github.com/Brumbelow/pyinc/blob/main/docs/pyinc-tools-guide.md) and [LSP reference](https://github.com/Brumbelow/pyinc/blob/main/docs/lsp-reference.md): CLI, editor setup, overlays, protocol methods, and user-visible limitations.
 - [Documentation index](https://github.com/Brumbelow/pyinc/blob/main/docs/README.md): every document, the package map, and the authoring and codegen guides.
-- [Releases and verification](https://github.com/Brumbelow/pyinc/blob/main/docs/releases.md): signed tags, trusted publishing, and checking a download.
+- [Releases and verification](https://github.com/Brumbelow/pyinc/blob/main/docs/releases.md): what the release workflow checks, trusted publishing, and checking a download.
 
 One distribution ships three top-level typed packages:
 
@@ -84,9 +84,9 @@ git clone https://github.com/Brumbelow/pyinc.git
 cd pyinc
 python3 -m venv .venv
 . .venv/bin/activate
-python3 -m pip install -e '.[dev]'
+python3 -m pip install -e '.[dev]' -c constraints.txt
 python3 scripts/check_docs.py
-pytest -q
+pytest -n auto -m 'not process' --ignore tests/test_properties.py --tb=short
 python3 -m mypy src tests bench scripts examples
 python3 -m mypy --platform win32 src tests bench scripts examples
 python3 -m ruff check src tests bench scripts examples

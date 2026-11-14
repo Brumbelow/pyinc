@@ -21,9 +21,9 @@ Please report privately through GitHub's
 [private vulnerability reporting](https://github.com/Brumbelow/pyinc/security/advisories/new).
 Keep vulnerability reports out of public issues.
 
-Expect an acknowledgement within 5 business days and an assessment within 10.
-If a fix is warranted, the release notes credit you, unless you prefer
-otherwise.
+Reports are read and answered on a best-effort basis, with no promised
+response time. If a fix is warranted, the release notes credit you, unless you
+prefer otherwise.
 
 ## Reporting a soundness violation
 
@@ -67,14 +67,9 @@ signposted are welcome.
 
 ## Release integrity
 
-Releases are published to PyPI from a tagged, signed commit through trusted
-publishing, without a stored API token. The release workflow verifies the
-annotated tag and every commit in the released range against the key in
-`.github/release-signing-key.asc`.
-
-The check has one pinned exception, the merge `3cf59c6`. It is accepted only
-when every parent verifies against that key and its tree equals a parent's
-tree, so every released byte still traces to maintainer-signed content.
+Releases are published to PyPI through trusted publishing, without a stored
+API token. The release workflow builds from an annotated tag at the tip of
+`main`.
 
 Each GitHub Release carries a `SHA256SUMS` file covering the exact
 distributions published to PyPI. After publication, a separate manually

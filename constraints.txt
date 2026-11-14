@@ -1,0 +1,26 @@
+# Exact versions of the dev and bench extras and everything they pull in.
+# CI installs with them, so a new release of a tool cannot fail a change
+# that did not touch it. Raise a pin by hand and let CI run on the change.
+#
+#   python -m pip install -e '.[dev]' -c constraints.txt
+ast-serialize==0.13.1
+cloudpickle==3.1.2
+colorama==0.4.6
+coverage==7.17.3
+execnet==2.1.2
+hypothesis==6.170.15
+iniconfig==2.3.1
+joblib==1.6.0
+librt==0.16.0
+mypy==2.4.1
+mypy-extensions==1.2.0
+packaging==26.3
+pathspec==1.1.1
+pluggy==1.7.0
+pygments==2.21.0
+pytest==9.2.0
+pytest-cov==7.1.0
+pytest-xdist==3.8.0
+ruff==0.17.5
+sortedcontainers==2.4.0
+typing-extensions==4.16.0

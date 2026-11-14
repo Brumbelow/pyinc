@@ -105,7 +105,7 @@ thresholds, so a figure measured on one CI runner would tell you little about
 your machine. Measure on your own hardware:
 
 ```console
-python -m pip install -e '.[bench]'
+python -m pip install -e '.[bench]' -c constraints.txt
 python -m bench.run --output bench/results --repetitions 5
 ```
 
@@ -133,9 +133,9 @@ thread outside every query is unaffected. See
 
 ### Free-threaded builds
 
-The test matrix runs the suite, and nightly the property suite, on the
-free-threaded CPython 3.14t build with the GIL disabled (`PYTHON_GIL=0`), on
-Linux, macOS, and Windows. The rules above still apply. One `Database` still
+The release matrix runs the suite on the free-threaded CPython 3.14t build
+with the GIL disabled (`PYTHON_GIL=0`), on Linux, macOS, and Windows. Every
+release tag runs it. The rules above still apply. One `Database` still
 serializes on its lock, and threads holding separate instances can now execute
 at the same time. pyinc claims no speedup, so measure it for your workload.
 
