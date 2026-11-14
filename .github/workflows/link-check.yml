@@ -3,6 +3,9 @@ name: Link check
 # Runs by dispatch only, and no other job waits on it. The documentation
 # checker that runs on every change stays offline, so an outside site going
 # down can never block a change or a release.
+#
+# pypi.org answers 200 for the project page of any name, real or not, so a
+# dead PyPI project link passes this job.
 on:
   workflow_dispatch:
 
