@@ -29,7 +29,11 @@ from ._jsonrpc import (
     validate_request,
     write_message,
 )
-from ._workspace import SESSION_CLOSED_MESSAGE
+from ._workspace import (
+    DEFAULT_MAX_WORKSPACE_FILES,
+    SESSION_CLOSED_MESSAGE,
+    WorkspaceTooLargeError,
+)
 from .session import (
     AnalysisDiagnostic,
     CallHierarchyCallSite,
@@ -491,6 +495,31 @@ def _format_symbol_declaration(symbol: Symbol) -> str:
     return bare_name
 
 
+def _refuse_broad_root(root: Path) -> None:
+    """Refuse a workspace root that holds whole trees of unrelated files.
+
+    A client started outside a project can send the home directory or a
+    filesystem root, or send no root so the server falls back to its working
+    directory. The server would copy every Python file under it.
+    """
+
+    resolved = root.resolve(strict=False)
+    if resolved.parent == resolved:
+        raise _RequestFailed(
+            f"The workspace root {resolved} is a filesystem root. Open a project folder."
+        )
+    try:
+        is_home = resolved.samefile(Path.home())
+    except (OSError, RuntimeError):
+        # A root that is not on disk, or a system with no home directory, has
+        # no home directory to match.
+        is_home = False
+    if is_home:
+        raise _RequestFailed(
+            f"The workspace root {resolved} is the home directory. Open a project folder."
+        )
+
+
 class LanguageServer:
     def __init__(
         self,
@@ -924,6 +953,7 @@ class LanguageServer:
 
     def _initialize(self, params: Any) -> dict[str, Any]:
         root = self._workspace_root_from_params(params)
+        _refuse_broad_root(Path(root))
         capabilities = params.get("capabilities") if isinstance(params, dict) else None
         self._position_encoding = negotiate_position_encoding(capabilities)
 
@@ -939,9 +969,19 @@ class LanguageServer:
             if isinstance(raw_exclusions, list)
             else ()
         )
+        raw_max_files = options.get("pyinc.workspace.maxFiles")
+        max_files = (
+            raw_max_files
+            if isinstance(raw_max_files, int)
+            and not isinstance(raw_max_files, bool)
+            and raw_max_files >= 1
+            else DEFAULT_MAX_WORKSPACE_FILES
+        )
         try:
             try:
-                session = WorkspaceSession(root, exclude_globs=exclude_globs)
+                session = WorkspaceSession(root, exclude_globs=exclude_globs, max_files=max_files)
+            except WorkspaceTooLargeError:
+                raise
             except ValueError as exc:
                 # The session refuses a root that is not a directory, or that
                 # holds a file it cannot mirror.
@@ -963,6 +1003,9 @@ class LanguageServer:
                 watcher = PollingWorkspaceWatcher(session, debounce_ms=debounce_ms)
                 self._watcher = watcher
                 watcher.start(self._on_watcher_change, interval_s=interval_s)
+        except WorkspaceTooLargeError as exc:
+            self._teardown_session()
+            raise _RequestFailed(str(exc)) from exc
         except BaseException:
             self._teardown_session()
             raise

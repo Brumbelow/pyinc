@@ -317,7 +317,7 @@ def test_workspace_mirror_rejects_escaping_directory_junction(tmp_path: Path) ->
         junction.rmdir()
 
 
-def test_workspace_mirror_rejects_in_root_file_symlink(tmp_path: Path) -> None:
+def test_workspace_mirror_skips_in_root_file_symlink(tmp_path: Path) -> None:
     target = tmp_path / "target.py"
     target.write_text("value = 1\n", encoding="utf-8")
     link = tmp_path / "alias.py"
@@ -326,8 +326,10 @@ def test_workspace_mirror_rejects_in_root_file_symlink(tmp_path: Path) -> None:
     except OSError:
         pytest.skip("file symlinks are not available")
 
-    with pytest.raises(ValueError, match="file symlinks are not supported"):
-        WorkspaceSession(tmp_path)
+    with WorkspaceSession(tmp_path) as session:
+        mirror = Path(session.mirror_root)
+        assert (mirror / "target.py").is_file()
+        assert not (mirror / "alias.py").exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO behavior")

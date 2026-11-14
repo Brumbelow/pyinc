@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import errno
+import functools
 import hashlib
+import io
 import os
 import shutil
+import tempfile
 import threading
 import tokenize
 from pathlib import Path
@@ -14,6 +17,11 @@ import pytest
 from _rendezvous import Rendezvous, run_in_threads
 
 import pyinc_tools._workspace as workspace
+import pyinc_tools.cli as cli
+import pyinc_tools.lsp as lsp_module
+from pyinc_tools._jsonrpc import read_message
+from pyinc_tools.lsp import LanguageServer
+from pyinc_tools.session import WorkspaceSession
 
 
 def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = False) -> None:
@@ -123,16 +131,22 @@ def test_workspace_link_detection_handles_windows_reparse_metadata(
     ("name", "expected"),
     [
         ("module.py", True),
-        ("stub.PYI", True),
+        ("pkg/module.py", True),
+        ("stub.pyi", False),
         ("pyproject.toml", True),
-        (".env", True),
-        ("Pipfile", True),
+        ("requirements.txt", True),
+        ("pkg/pyproject.toml", False),
+        ("docs/requirements.txt", False),
+        (".env", False),
+        ("Pipfile", False),
+        ("setup.cfg", False),
+        ("data.json", False),
         ("requirements.in", False),
         ("image.png", False),
     ],
 )
-def test_relevant_file_classification(name: str, expected: bool) -> None:
-    assert workspace._is_relevant_file(Path(name)) is expected
+def test_relevant_file_classification(tmp_path: Path, name: str, expected: bool) -> None:
+    assert workspace._is_relevant_file(tmp_path / name, tmp_path) is expected
 
 
 def test_exclusion_matching_supports_fnmatch_path_match_and_outside_paths(tmp_path: Path) -> None:
@@ -783,17 +797,17 @@ def test_workspace_mirror_keeps_normally_relevant_files_when_reference_is_remove
     mirror_root = tmp_path / "mirror"
     root.mkdir()
     mirror_root.mkdir()
-    referenced = root / "constraints.txt"
+    referenced = root / "pins.py"
     referenced.write_text("package\n", encoding="utf-8")
     requirements = root / "requirements.txt"
-    requirements.write_text("-r constraints.txt\n", encoding="utf-8")
+    requirements.write_text("-r pins.py\n", encoding="utf-8")
     mirror = workspace.WorkspaceMirror(str(root), str(mirror_root), frozenset(), ())
     mirror.copy_workspace()
 
     requirements.write_text("package\n", encoding="utf-8")
     mirror.sync_path_from_disk(str(requirements))
 
-    assert (mirror_root / "constraints.txt").read_text(encoding="utf-8") == "package\n"
+    assert (mirror_root / "pins.py").read_text(encoding="utf-8") == "package\n"
 
 
 def test_workspace_mirror_prunes_empty_missing_parents_but_keeps_nonempty_ones(
@@ -1088,3 +1102,303 @@ def test_watcher_error_handler_uses_callback_or_stderr(
     watcher._on_error = None
     watcher._handle_error(error)
     assert capsys.readouterr().err == "pyinc-tools watcher: callback raised: ValueError: broken\n"
+
+
+def _mirrored_files(mirror_root: Path) -> set[str]:
+    return {
+        path.relative_to(mirror_root).as_posix()
+        for path in mirror_root.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_walk_skips_environments_tool_directories_and_egg_info(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    kept = ("pkg/mod.py", "env/mod.py", "build/mod.py")
+    skipped = (
+        "node_modules/dep/setup.py",
+        "venv/lib/mod.py",
+        ".tox/py311/mod.py",
+        ".nox/tests/mod.py",
+        ".eggs/dep/mod.py",
+        "pkg.egg-info/mod.py",
+        "vendor/site-packages/dep.py",
+        "__pypackages__/3.11/lib/dep.py",
+        "tools/runner/lib/mod.py",
+    )
+    for relative in kept + skipped:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("pass\n", encoding="utf-8")
+    # A virtual environment can have any name. Its pyvenv.cfg marks it.
+    (root / "tools" / "runner" / "pyvenv.cfg").write_text("home = /usr\n", encoding="utf-8")
+
+    files, _referenced = workspace._workspace_files(
+        str(root), workspace.DEFAULT_IGNORED_DIR_NAMES, ()
+    )
+
+    assert {path.relative_to(root).as_posix() for path in files} == set(kept)
+
+
+def test_path_filter_skips_environments_and_egg_info(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    (root / "tools" / "runner").mkdir(parents=True)
+    (root / "tools" / "runner" / "pyvenv.cfg").write_text("home = /usr\n", encoding="utf-8")
+    ignored = workspace.DEFAULT_IGNORED_DIR_NAMES
+
+    assert workspace._workspace_path_allowed(root / "tools" / "mod.py", root, ignored, ())
+    assert not workspace._workspace_path_allowed(
+        root / "tools" / "runner" / "lib" / "mod.py", root, ignored, ()
+    )
+    assert not workspace._workspace_path_allowed(root / "venv" / "mod.py", root, ignored, ())
+    assert not workspace._workspace_path_allowed(
+        root / "pkg.egg-info" / "mod.py", root, frozenset(), ()
+    )
+
+
+def test_mirror_holds_only_python_files_and_the_root_manifests(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    mirror_root = tmp_path / "mirror"
+    files = {
+        "mod.py": "pass\n",
+        "pkg/__init__.py": "",
+        "pyproject.toml": "[project]\nname = 'demo'\n",
+        "requirements.txt": "-r deps/base.in\n",
+        "deps/base.in": "-c pins.txt\n",
+        "deps/pins.txt": "demo==1\n",
+        ".env": "TOKEN=secret\n",
+        "data.csv": "a,b\n",
+        "conf.json": "{}\n",
+        "setup.cfg": "[metadata]\n",
+        "stub.pyi": "x: int\n",
+        "notebook.ipynb": "{}\n",
+        "pkg/pyproject.toml": "[project]\nname = 'inner'\n",
+        "docs/requirements.txt": "sphinx\n",
+    }
+    for relative, text in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    mirror = workspace.WorkspaceMirror(str(root), str(mirror_root), frozenset(), ())
+
+    mirror.copy_workspace()
+
+    assert _mirrored_files(mirror_root) == {
+        "mod.py",
+        "pkg/__init__.py",
+        "pyproject.toml",
+        "requirements.txt",
+        "deps/base.in",
+        "deps/pins.txt",
+    }
+
+
+def test_walk_skips_an_in_root_file_link(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    target = root / "target.py"
+    target.write_text("pass\n", encoding="utf-8")
+    _symlink_or_skip(root / "alias.py", target)
+
+    files, _referenced = workspace._workspace_files(str(root), frozenset(), ())
+
+    assert files == {target}
+
+
+def test_walk_refuses_more_files_than_its_limit(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    for name in ("a.py", "b.py", "c.py"):
+        (root / name).write_text("pass\n", encoding="utf-8")
+
+    files, _referenced = workspace._workspace_files(str(root), frozenset(), (), 3)
+    assert len(files) == 3
+
+    with pytest.raises(workspace.WorkspaceTooLargeError) as raised:
+        workspace._workspace_files(str(root), frozenset(), (), 2)
+    message = str(raised.value)
+    assert "more than 2 " in message
+    assert "pyinc.workspace.exclude" in message
+    assert "pyinc.workspace.maxFiles" in message
+
+
+def test_session_refuses_more_than_a_thousand_files_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    for index in range(1_001):
+        (root / f"m{index}.py").write_text("pass\n", encoding="utf-8")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+
+    with pytest.raises(workspace.WorkspaceTooLargeError, match="more than 1,000 "):
+        WorkspaceSession(root)
+
+    # The refused session leaves no mirror directory behind.
+    assert list(scratch.iterdir()) == []
+
+
+def test_cli_reports_a_workspace_over_the_file_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    for name in ("a.py", "b.py", "c.py"):
+        (root / name).write_text("pass\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "WorkspaceSession", functools.partial(WorkspaceSession, max_files=2))
+
+    assert cli.main(["analyze", str(root)]) == cli.EXIT_ERROR
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "more than 2 " in captured.err
+    assert "pyinc.workspace.maxFiles" in captured.err
+
+
+def _initialize(root: Path, options: dict[str, Any]) -> tuple[LanguageServer, dict[str, Any]]:
+    output = io.BytesIO()
+    server = LanguageServer(in_stream=io.BytesIO(), out_stream=output)
+    server._handle_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "rootUri": root.as_uri(),
+                "initializationOptions": {"pyinc.watcher.enabled": False, **options},
+            },
+        }
+    )
+    output.seek(0)
+    reply = read_message(output)
+    assert reply is not None
+    return server, reply
+
+
+def test_initialize_refuses_a_workspace_over_its_file_limit(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    for name in ("a.py", "b.py", "c.py"):
+        (root / name).write_text("pass\n", encoding="utf-8")
+
+    server, reply = _initialize(root, {"pyinc.workspace.maxFiles": 2})
+    try:
+        assert reply["error"]["code"] == -32803
+        message = reply["error"]["message"]
+        assert "more than 2 " in message
+        assert "pyinc.workspace.exclude" in message
+        assert "pyinc.workspace.maxFiles" in message
+        assert server._session is None
+    finally:
+        server._teardown_session()
+
+    server, reply = _initialize(root, {"pyinc.workspace.maxFiles": 3})
+    try:
+        assert "capabilities" in reply["result"]
+    finally:
+        server._teardown_session()
+
+
+def test_initialize_refuses_more_than_a_thousand_files_by_default(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    for index in range(1_001):
+        (root / f"m{index}.py").write_text("pass\n", encoding="utf-8")
+
+    # A missing limit and an invalid one both fall back to 1,000 files.
+    for options in ({}, {"pyinc.workspace.maxFiles": True}, {"pyinc.workspace.maxFiles": 0}):
+        server, reply = _initialize(root, options)
+        try:
+            assert reply["error"]["code"] == -32803, options
+            assert "more than 1,000 " in reply["error"]["message"], options
+            assert server._session is None, options
+        finally:
+            server._teardown_session()
+
+
+def _refuse_to_walk(*_args: object, **_kwargs: object) -> WorkspaceSession:
+    raise AssertionError("the workspace walk ran")
+
+
+def test_initialize_refuses_the_home_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: home))
+    monkeypatch.setattr(lsp_module, "WorkspaceSession", _refuse_to_walk)
+
+    server, reply = _initialize(home, {})
+
+    assert reply["error"]["code"] == -32803
+    assert "home directory" in reply["error"]["message"]
+    assert server._session is None
+
+
+def test_initialize_refuses_a_filesystem_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lsp_module, "WorkspaceSession", _refuse_to_walk)
+
+    server, reply = _initialize(Path(tmp_path.anchor), {})
+
+    assert reply["error"]["code"] == -32803
+    assert "filesystem root" in reply["error"]["message"]
+    assert server._session is None
+
+
+def test_a_second_poll_reads_no_unchanged_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    edited = tmp_path / "b.py"
+    edited.write_text("y = 1\n", encoding="utf-8")
+    watcher = workspace.PollingWorkspaceWatcher(_Driver(tmp_path), debounce_ms=0)
+    reads: list[str] = []
+    original = workspace._read_workspace_file
+
+    def counting(path: Path, root: Path) -> bytes:
+        # The walk also tries the absent root requirements.txt, which reads
+        # nothing.
+        content = original(path, root)
+        reads.append(path.name)
+        return content
+
+    monkeypatch.setattr(workspace, "_read_workspace_file", counting)
+
+    assert watcher.poll() == ()
+    assert sorted(reads) == ["a.py", "b.py"]
+    reads.clear()
+
+    assert watcher.poll() == ()
+    assert reads == []
+
+    # A rewrite of the same size is found by its new modification time.
+    before = edited.stat()
+    edited.write_text("y = 2\n", encoding="utf-8")
+    os.utime(edited, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    assert watcher.poll() == (str(edited.resolve()),)
+    assert reads == ["b.py"]
+    reads.clear()
+
+    # A rewrite that keeps the modification time is found by its new size.
+    before = edited.stat()
+    edited.write_text("y = 1000\n", encoding="utf-8")
+    os.utime(edited, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert watcher.poll() == (str(edited.resolve()),)
+    assert reads == ["b.py"]
+
+
+def test_watcher_polls_every_half_second_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watcher = workspace.PollingWorkspaceWatcher(_Driver(tmp_path))
+    intervals: list[float] = []
+    monkeypatch.setattr(watcher, "_run", intervals.append)
+
+    watcher.start(lambda _paths: None)
+    watcher.stop(timeout=10)
+
+    assert intervals == [0.5]

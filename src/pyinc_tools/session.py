@@ -231,6 +231,7 @@ from ._workspace import (
     DEFAULT_IGNORED_DIR_NAMES as DEFAULT_IGNORED_DIR_NAMES,
 )
 from ._workspace import (
+    DEFAULT_MAX_WORKSPACE_FILES,
     SESSION_CLOSED_MESSAGE,
     WorkspaceMirror,
     _encode_python_text,
@@ -342,6 +343,7 @@ class WorkspaceSession:
         mode: str = "strict",
         ignored_dir_names: tuple[str, ...] | None = None,
         exclude_globs: tuple[str, ...] = (),
+        max_files: int = DEFAULT_MAX_WORKSPACE_FILES,
     ) -> None:
         root_path = Path(root).resolve(strict=False)
         if not root_path.exists() or not root_path.is_dir():
@@ -363,6 +365,7 @@ class WorkspaceSession:
             self.mirror_root,
             self._ignored_dir_names,
             self._exclude_globs,
+            max_files=max_files,
         )
         self._overlays: dict[str, str] = {}
         self._scheduled_paths: set[str] = set()
@@ -370,7 +373,12 @@ class WorkspaceSession:
         self._watchers: set[PollingWorkspaceWatcher] = set()
         self._close_complete = threading.Event()
         self._closed = False
-        self._mirror.copy_workspace()
+        try:
+            self._mirror.copy_workspace()
+        except BaseException:
+            # The caller never gets a session to close, so the mirror goes now.
+            self._tempdir.cleanup()
+            raise
 
     def close(self) -> None:
         with self._state_lock:

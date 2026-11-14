@@ -29,13 +29,25 @@ DEFAULT_IGNORED_DIR_NAMES = frozenset(
         ".ruff_cache",
         ".hypothesis",
         "dist",
+        "node_modules",
+        "venv",
+        ".tox",
+        ".nox",
+        ".eggs",
+        "site-packages",
+        "__pypackages__",
     }
 )
 
-_RELEVANT_SUFFIXES = frozenset(
-    {".py", ".pyi", ".toml", ".json", ".xml", ".csv", ".ipynb", ".txt", ".cfg", ".ini"}
-)
-_RELEVANT_NAMES = frozenset({".env", "Pipfile", "pyproject.toml"})
+# The session reads Python sources anywhere in the root, and pyproject.toml and
+# requirements.txt only at the root. The mirror copies those files and the root
+# requirements file's include closure, and nothing else.
+_ROOT_MANIFEST_NAMES = frozenset({"pyproject.toml", "requirements.txt"})
+# A session refuses a workspace with more files than this to copy. Past it the
+# root is most likely a parent of several projects or holds vendored trees.
+DEFAULT_MAX_WORKSPACE_FILES = 1_000
+# Every poll walks the workspace and stats each file it copies.
+_DEFAULT_POLL_INTERVAL_S = 0.5
 # The signal a closed session raises to its watcher. A driver that reports no
 # closed state is recognized by this message alone.
 SESSION_CLOSED_MESSAGE = "WorkspaceSession is closed."
@@ -46,6 +58,19 @@ SESSION_CLOSED_MESSAGE = "WorkspaceSession is closed."
 # be reported as an unsafe path.
 _MISSING_PATH_ERRORS = (FileNotFoundError, NotADirectoryError)
 _REQUIREMENTS_REFERENCE = re.compile(r"^(?:-r|--requirement|-c|--constraint)\s+(.+)$")
+
+
+class WorkspaceTooLargeError(ValueError):
+    """The workspace holds more files than the session accepts."""
+
+    def __init__(self, root: str, limit: int) -> None:
+        super().__init__(
+            f"The workspace {root} holds more than {limit:,} Python and manifest files. "
+            "Exclude directories with pyinc.workspace.exclude, or raise the limit with "
+            "pyinc.workspace.maxFiles."
+        )
+        self.root = root
+        self.limit = limit
 
 
 def _encode_python_text(source: str) -> bytes:
@@ -116,7 +141,27 @@ def _workspace_path_allowed(
         return False
     if any(part in ignored_dir_names for part in relative.parts):
         return False
+    directory = root
+    for part in relative.parts[:-1]:
+        directory /= part
+        if _is_ignored_directory(directory, ignored_dir_names):
+            return False
     return not _is_excluded(path, root, exclude_globs)
+
+
+def _is_ignored_directory(path: Path, ignored_dir_names: frozenset[str]) -> bool:
+    """Whether the walk leaves out the directory at `path`.
+
+    Packaging metadata directories end in `.egg-info`. A virtual environment
+    can have any name, and the `pyvenv.cfg` at its top marks it.
+    """
+
+    if path.name in ignored_dir_names or path.name.endswith(".egg-info"):
+        return True
+    try:
+        return (path / "pyvenv.cfg").is_file()
+    except OSError:
+        return False
 
 
 def _is_workspace_link(path: Path) -> bool:
@@ -368,7 +413,14 @@ def _workspace_files(
     root: str,
     ignored_dir_names: frozenset[str],
     exclude_globs: tuple[str, ...],
+    max_files: int | None = None,
 ) -> tuple[set[Path], set[Path]]:
+    """Return the files the mirror copies, and the requirements includes among them.
+
+    With `max_files`, the walk stops and raises `WorkspaceTooLargeError` as soon
+    as it has found more files than that.
+    """
+
     root_path = Path(root).resolve(strict=False)
     files: set[Path] = set()
     for current_root, dirnames, filenames in os.walk(root_path):
@@ -376,7 +428,9 @@ def _workspace_files(
         kept_dirs: list[str] = []
         for name in dirnames:
             path = current_path / name
-            if name in ignored_dir_names or _is_excluded(path, root_path, exclude_globs):
+            if _is_ignored_directory(path, ignored_dir_names) or _is_excluded(
+                path, root_path, exclude_globs
+            ):
                 continue
             if _is_workspace_link(path):
                 _validate_symlink(path, root_path)
@@ -385,16 +439,22 @@ def _workspace_files(
         dirnames[:] = kept_dirs
         for filename in filenames:
             source_path = current_path / filename
-            if not _is_relevant_file(source_path) or _is_excluded(
+            if not _is_relevant_file(source_path, root_path) or _is_excluded(
                 source_path, root_path, exclude_globs
             ):
                 continue
             if _is_workspace_link(source_path):
+                # Skipped as a directory link is. A link out of the root still
+                # refuses the workspace.
                 _validate_symlink(source_path, root_path)
-                raise ValueError(f"workspace file symlinks are not supported: {source_path!s}")
+                continue
             files.add(source_path)
+            if max_files is not None and len(files) > max_files:
+                raise WorkspaceTooLargeError(str(root_path), max_files)
     referenced = _requirements_reference_paths(root_path, ignored_dir_names, exclude_globs)
     files.update(path for path in referenced if path.is_file())
+    if max_files is not None and len(files) > max_files:
+        raise WorkspaceTooLargeError(str(root_path), max_files)
     return files, referenced
 
 
@@ -402,20 +462,49 @@ def _collect_filesystem_snapshot(
     root: str,
     ignored_dir_names: frozenset[str],
     exclude_globs: tuple[str, ...] = (),
+    stat_cache: dict[str, tuple[int, int, str]] | None = None,
 ) -> dict[str, str]:
+    """Sha256 per path of every file the mirror copies.
+
+    `stat_cache` maps a path to its modification time in nanoseconds, its size
+    and its hash. A file whose time and size match its entry keeps that hash
+    and is not read. The cache is left holding an entry for each file hashed
+    here. The stat is taken before the read, so an edit that lands during the
+    read changes the stat the next snapshot sees.
+    """
+
+    root_path = Path(root).resolve(strict=False)
+    previous = dict(stat_cache) if stat_cache is not None else {}
+    current: dict[str, tuple[int, int, str]] = {}
     snapshot: dict[str, str] = {}
     files, _referenced = _workspace_files(root, ignored_dir_names, exclude_globs)
     for source_path in files:
+        key = str(source_path)
         try:
-            content = _read_workspace_file(source_path, Path(root).resolve(strict=False))
+            metadata = source_path.lstat()
         except _MISSING_PATH_ERRORS:
             continue
-        snapshot[str(source_path)] = hashlib.sha256(content).hexdigest()
+        cached = previous.get(key)
+        if cached is not None and cached[:2] == (metadata.st_mtime_ns, metadata.st_size):
+            digest = cached[2]
+        else:
+            try:
+                content = _read_workspace_file(source_path, root_path)
+            except _MISSING_PATH_ERRORS:
+                continue
+            digest = hashlib.sha256(content).hexdigest()
+        snapshot[key] = digest
+        current[key] = (metadata.st_mtime_ns, metadata.st_size, digest)
+    if stat_cache is not None:
+        stat_cache.clear()
+        stat_cache.update(current)
     return snapshot
 
 
-def _is_relevant_file(path: Path) -> bool:
-    return path.name in _RELEVANT_NAMES or path.suffix.lower() in _RELEVANT_SUFFIXES
+def _is_relevant_file(path: Path, root: Path) -> bool:
+    if path.suffix == ".py":
+        return True
+    return path.name in _ROOT_MANIFEST_NAMES and path.parent == root
 
 
 def _is_excluded(path: Path, root: Path, patterns: tuple[str, ...]) -> bool:
@@ -452,17 +541,22 @@ class WorkspaceMirror:
         mirror_root: str,
         ignored_dir_names: frozenset[str],
         exclude_globs: tuple[str, ...],
+        *,
+        max_files: int | None = None,
     ) -> None:
         self.root_path = Path(root).resolve(strict=False)
         self.root = str(self.root_path)
         self.mirror_root_path = Path(mirror_root).resolve(strict=False)
         self.ignored_dir_names = ignored_dir_names
         self.exclude_globs = exclude_globs
+        self.max_files = max_files
         self._referenced_paths: set[Path] = set()
         self._content_hashes: dict[str, str] = {}
 
     def copy_workspace(self) -> None:
-        files, referenced = _workspace_files(self.root, self.ignored_dir_names, self.exclude_globs)
+        files, referenced = _workspace_files(
+            self.root, self.ignored_dir_names, self.exclude_globs, self.max_files
+        )
         hashes: dict[str, str] = {}
         for source_path in files:
             relative = source_path.relative_to(self.root_path)
@@ -521,13 +615,15 @@ class WorkspaceMirror:
             self.ignored_dir_names,
             self.exclude_globs,
         )
-        relevant = allowed and (_is_relevant_file(source_path) or source_path in referenced)
+        relevant = allowed and (
+            _is_relevant_file(source_path, self.root_path) or source_path in referenced
+        )
         self._sync_one_path(source_path, relevant=relevant)
 
         for added in referenced - self._referenced_paths:
             self._sync_one_path(added, relevant=True)
         for removed in self._referenced_paths - referenced:
-            if not _is_relevant_file(removed):
+            if not _is_relevant_file(removed, self.root_path):
                 self._sync_one_path(removed, relevant=False)
         self._referenced_paths = referenced
 
@@ -606,6 +702,10 @@ class PollingWorkspaceWatcher:
         self._session = session
         self._debounce_seconds = debounce_ms / 1000.0
         self._clock = clock or time.monotonic
+        # Polls reuse a file's hash while its size and modification time hold.
+        # The baseline does not fill it, so the first poll reads every file
+        # and finds any edit made since the baseline was taken.
+        self._stat_cache: dict[str, tuple[int, int, str]] = {}
         self._snapshot = self._baseline_snapshot()
         self._pending: dict[str, float] = {}
         self._thread: threading.Thread | None = None
@@ -659,6 +759,7 @@ class PollingWorkspaceWatcher:
             self._session.root,
             self._session._ignored_dir_names,
             self._session._exclude_globs,
+            self._stat_cache,
         )
 
         changed_paths = {
@@ -699,9 +800,7 @@ class PollingWorkspaceWatcher:
         with self._lifecycle_lock:
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("PollingWorkspaceWatcher is already running.")
-            effective_interval = (
-                interval_s if interval_s is not None else max(self._debounce_seconds / 2.0, 0.05)
-            )
+            effective_interval = interval_s if interval_s is not None else _DEFAULT_POLL_INTERVAL_S
             self._register_with_session()
             self._on_change = on_change
             self._on_error = on_error
@@ -844,7 +943,9 @@ PollingWorkspaceWatcher.__module__ = "pyinc_tools.session"
 
 __all__ = [
     "DEFAULT_IGNORED_DIR_NAMES",
+    "DEFAULT_MAX_WORKSPACE_FILES",
     "SESSION_CLOSED_MESSAGE",
     "PollingWorkspaceWatcher",
     "WorkspaceMirror",
+    "WorkspaceTooLargeError",
 ]
