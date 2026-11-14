@@ -105,7 +105,7 @@ thresholds, so a figure measured on one CI runner would tell you little about
 your machine. Measure on your own hardware:
 
 ```console
-python -m pip install -e '.[bench]'
+python -m pip install -e '.[bench]' -c constraints.txt
 python -m bench.run --output bench/results --repetitions 5
 ```
 

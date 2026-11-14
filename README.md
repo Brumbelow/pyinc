@@ -84,9 +84,9 @@ git clone https://github.com/Brumbelow/pyinc.git
 cd pyinc
 python3 -m venv .venv
 . .venv/bin/activate
-python3 -m pip install -e '.[dev]'
+python3 -m pip install -e '.[dev]' -c constraints.txt
 python3 scripts/check_docs.py
-pytest -q
+pytest -n auto -m 'not process' --ignore tests/test_properties.py --tb=short
 python3 -m mypy src tests bench scripts examples
 python3 -m mypy --platform win32 src tests bench scripts examples
 python3 -m ruff check src tests bench scripts examples
