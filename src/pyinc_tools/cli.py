@@ -12,6 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 from types import FrameType
 
+from ._workspace import DEFAULT_MAX_WORKSPACE_FILES
 from .lsp import LanguageServer, _package_version
 from .session import (
     AnalysisDiagnostic,
@@ -99,6 +100,15 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=(_FAIL_ON_NEVER, "error", "warning", "information", "hint"),
         default=_FAIL_ON_NEVER,
         help="Exit with status 3 when a diagnostic of at least this severity is reported.",
+    )
+    analyze.add_argument(
+        "--max-files",
+        type=_positive_int,
+        default=DEFAULT_MAX_WORKSPACE_FILES,
+        help=(
+            "Refuse a workspace with more Python and manifest files than this "
+            f"(default {DEFAULT_MAX_WORKSPACE_FILES:,})."
+        ),
     )
 
     lsp = subparsers.add_parser("lsp", help="Start the stdio LSP adapter.")
@@ -241,7 +251,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return EXIT_USAGE
         try:
-            session_context = WorkspaceSession(args.root)
+            session_context = WorkspaceSession(args.root, max_files=args.max_files)
         except (OSError, ValueError) as exc:
             print(f"pyinc-tools: {exc}", file=sys.stderr)
             return EXIT_ERROR

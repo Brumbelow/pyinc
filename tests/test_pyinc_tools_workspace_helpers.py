@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import functools
 import hashlib
 import io
 import os
@@ -1347,15 +1346,14 @@ def test_session_refuses_more_than_a_thousand_files_by_default(
 
 
 def test_cli_reports_a_workspace_over_the_file_limit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = tmp_path / "root"
     root.mkdir()
     for name in ("a.py", "b.py", "c.py"):
         (root / name).write_text("pass\n", encoding="utf-8")
-    monkeypatch.setattr(cli, "WorkspaceSession", functools.partial(WorkspaceSession, max_files=2))
 
-    assert cli.main(["analyze", str(root)]) == cli.EXIT_ERROR
+    assert cli.main(["analyze", str(root), "--max-files", "2"]) == cli.EXIT_ERROR
 
     captured = capsys.readouterr()
     assert captured.out == ""

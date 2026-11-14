@@ -19,6 +19,7 @@ import pytest
 import pyinc_tools.cli as cli
 from pyinc.integrations import SourcePosition, SourceRange
 from pyinc_tools import AnalysisDiagnostic
+from pyinc_tools._workspace import DEFAULT_MAX_WORKSPACE_FILES
 
 
 def _diagnostic(
@@ -74,6 +75,7 @@ class _Session:
         self.entered = False
         self.exited = False
         self.analyzed_paths: list[str] = []
+        self.options: dict[str, object] = {}
 
     def __enter__(self) -> _Session:
         self.entered = True
@@ -139,8 +141,9 @@ class _Event:
 def session_factory(monkeypatch: pytest.MonkeyPatch) -> list[_Session]:
     sessions: list[_Session] = []
 
-    def build(root: str) -> _Session:
+    def build(root: str, **options: object) -> _Session:
         session = _Session(root)
+        session.options = options
         sessions.append(session)
         return session
 
@@ -175,7 +178,7 @@ def test_main_reports_workspace_construction_errors(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    def fail(_root: str) -> _Session:
+    def fail(_root: str, **_options: object) -> _Session:
         raise error
 
     monkeypatch.setattr(cli, "WorkspaceSession", fail)
@@ -191,7 +194,7 @@ def test_main_reports_analysis_errors_and_closes_session(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     session = _Session("/workspace", analysis_error=error)
-    monkeypatch.setattr(cli, "WorkspaceSession", lambda _root: session)
+    monkeypatch.setattr(cli, "WorkspaceSession", lambda _root, **_options: session)
 
     assert cli.main(["analyze", "/workspace"]) == cli.EXIT_ERROR
     assert capsys.readouterr().err == f"pyinc-tools: {error}\n"
@@ -310,7 +313,7 @@ def _install_diagnostic_session(
 ) -> list[_DiagnosticSession]:
     sessions: list[_DiagnosticSession] = []
 
-    def build(root: str) -> _DiagnosticSession:
+    def build(root: str, **_options: object) -> _DiagnosticSession:
         session = _DiagnosticSession(root, diagnostics)
         sessions.append(session)
         return session
@@ -546,6 +549,51 @@ def test_path_that_is_not_an_existing_file_exits_1_and_names_it(
     assert output.out == ""
     expected = root.resolve() / name
     assert output.err == f"pyinc-tools: {expected} is not an existing file.\n"
+
+
+def test_max_files_sets_the_workspace_file_limit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    for name in ("a.py", "b.py", "c.py"):
+        (root / name).write_text("pass\n", encoding="utf-8")
+
+    assert cli.main(["analyze", str(root), "--max-files", "2"]) == cli.EXIT_ERROR
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "more than 2 " in output.err
+    assert str(root.resolve()) in output.err
+    assert "--max-files" in output.err
+
+    assert cli.main(["analyze", str(root), "--max-files", "3"]) == cli.EXIT_SUCCESS
+
+
+def test_max_files_defaults_to_the_session_limit(session_factory: list[_Session]) -> None:
+    assert cli.main(["analyze", "/workspace"]) == cli.EXIT_SUCCESS
+    assert cli.main(["analyze", "/workspace", "--max-files", "5"]) == cli.EXIT_SUCCESS
+
+    assert [session.options for session in session_factory] == [
+        {"max_files": DEFAULT_MAX_WORKSPACE_FILES},
+        {"max_files": 5},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "reason"), [("0", "must be at least 1"), ("x", "invalid int value")]
+)
+def test_max_files_below_one_or_not_a_number_is_a_usage_error(
+    value: str,
+    reason: str,
+    session_factory: list[_Session],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["analyze", "/workspace", "--max-files", value])
+
+    assert raised.value.code == cli.EXIT_USAGE
+    assert f"argument --max-files: {reason}" in capsys.readouterr().err
+    assert session_factory == []
 
 
 class _ClosedPipeStdout:

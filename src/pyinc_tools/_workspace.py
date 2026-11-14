@@ -69,8 +69,9 @@ class WorkspaceTooLargeError(ValueError):
     def __init__(self, root: str, limit: int) -> None:
         super().__init__(
             f"The workspace {root} holds more than {limit:,} Python and manifest files. "
-            "Exclude directories with pyinc.workspace.exclude, or raise the limit with "
-            "pyinc.workspace.maxFiles."
+            "In the language server, exclude directories with pyinc.workspace.exclude "
+            "or raise the limit with pyinc.workspace.maxFiles. "
+            "On the command line, raise the limit with --max-files."
         )
         self.root = root
         self.limit = limit
